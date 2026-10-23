@@ -7,44 +7,32 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ============================================================
-# 1. CONFIGURATION
-# ============================================================
-
-$SonarBaseUrl = "https://aas-sonar-pr.azure-paas.com".TrimEnd("/")
+# Configuration
+$BaseUrl = "https://aas-sonar-pr.azure-paas.com".TrimEnd("/")
 $PageSize = 500
+$OutputDirectory = $PSScriptRoot
 
-$ReportDirectory = $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($ReportDirectory)) {
-    $ReportDirectory = (Get-Location).Path
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = (Get-Location).Path
 }
 
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 
-$NoBindingReportPath = Join-Path `
-    $ReportDirectory `
-    "SonarProjects_WithoutBinding_$Timestamp.csv"
+$NoBindingCsv = Join-Path $OutputDirectory "Sonar_Projects_Without_Binding_$Timestamp.csv"
+$ErrorsCsv = Join-Path $OutputDirectory "Sonar_Binding_Check_Errors_$Timestamp.csv"
 
-$ErrorReportPath = Join-Path `
-    $ReportDirectory `
-    "SonarProjects_BindingCheckErrors_$Timestamp.csv"
-
-# ============================================================
-# 2. AUTHENTICATION
-# ============================================================
-
-$SonarToken = $SonarTokenOverride
-
-if ([string]::IsNullOrWhiteSpace($SonarToken)) {
-    $SonarToken = $env:SONARQUBE_TOKEN
+# Authentication
+$Token = $SonarTokenOverride
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    $Token = $env:SONARQUBE_TOKEN
 }
 
-if ([string]::IsNullOrWhiteSpace($SonarToken)) {
-    throw "SONARQUBE_TOKEN is not defined. Set it or use -SonarTokenOverride."
+if ([string]::IsNullOrWhiteSpace($Token)) {
+    throw "SONARQUBE_TOKEN is not defined."
 }
 
 $EncodedAuth = [Convert]::ToBase64String(
-    [Text.Encoding]::ASCII.GetBytes("${SonarToken}:")
+    [Text.Encoding]::ASCII.GetBytes("${Token}:")
 )
 
 $Headers = @{
@@ -54,273 +42,162 @@ $Headers = @{
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-try {
-    if ([System.Net.WebRequest]::DefaultWebProxy) {
-        [System.Net.WebRequest]::DefaultWebProxy.Credentials =
-            [System.Net.CredentialCache]::DefaultCredentials
-    }
-}
-catch {
-    # Ignore proxy configuration errors.
-}
-
-# ============================================================
-# 3. HELPER FUNCTIONS
-# ============================================================
-
+# Get HTTP status safely across PowerShell/.NET versions.
 function Get-HttpStatusCode {
     param(
         [Parameter(Mandatory)]
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    $response = $null
-
     try {
         $response = $ErrorRecord.Exception.Response
-    }
-    catch {
-        $response = $null
-    }
-
-    if ($null -ne $response) {
-        try {
-            if ($null -ne $response.StatusCode) {
+        if ($null -ne $response) {
+            try {
                 return [int]$response.StatusCode
             }
-        }
-        catch {
-            # Try alternative representations.
-        }
-
-        try {
-            if ($null -ne $response.StatusCode.value__) {
-                return [int]$response.StatusCode.value__
+            catch {
+                try {
+                    return [int]$response.StatusCode.value__
+                }
+                catch {}
             }
         }
-        catch {
-            # Continue.
-        }
     }
+    catch {}
 
     try {
-        $statusCode = $ErrorRecord.Exception.StatusCode
-        if ($null -ne $statusCode) {
-            return [int]$statusCode
+        if ($null -ne $ErrorRecord.Exception.StatusCode) {
+            return [int]$ErrorRecord.Exception.StatusCode
         }
     }
-    catch {
-        # Continue.
-    }
-
-    try {
-        $innerResponse = $ErrorRecord.Exception.InnerException.Response
-        if ($null -ne $innerResponse.StatusCode) {
-            return [int]$innerResponse.StatusCode
-        }
-    }
-    catch {
-        # No response available.
-    }
+    catch {}
 
     return $null
 }
 
-function Get-ErrorDescription {
+function Get-ErrorText {
     param(
         [Parameter(Mandatory)]
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    $statusCode = Get-HttpStatusCode -ErrorRecord $ErrorRecord
+    $status = Get-HttpStatusCode -ErrorRecord $ErrorRecord
     $message = $ErrorRecord.Exception.Message
 
-    if ($ErrorRecord.ErrorDetails -and
-        -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
         $message += " | " + $ErrorRecord.ErrorDetails.Message
     }
 
-    if ($null -ne $statusCode) {
-        return "HTTP $statusCode : $message"
+    if ($null -ne $status) {
+        return "HTTP $status : $message"
     }
 
-    return "HTTP status unavailable: $message"
+    return $message
 }
 
-function Add-ErrorRow {
-    param(
-        [Parameter(Mandatory)][string]$ProjectName,
-        [Parameter(Mandatory)][string]$ProjectKey,
-        [Parameter(Mandatory)][string]$Reason
-    )
+# Verify connectivity
+Write-Host "Checking SonarQube..." -ForegroundColor Cyan
 
-    $script:Errors.Add([PSCustomObject]@{
-        ProjectName = $ProjectName
-        ProjectKey  = $ProjectKey
-        Reason      = $Reason
-    }) | Out-Null
-}
+$version = Invoke-RestMethod `
+    -Uri "${BaseUrl}/api/server/version" `
+    -Method GET `
+    -Headers $Headers `
+    -ErrorAction Stop
 
-# ============================================================
-# 4. CONNECT TO SONARQUBE
-# ============================================================
+Write-Host "SonarQube version: $version" -ForegroundColor Green
 
-Write-Host "`nChecking SonarQube connectivity..." -ForegroundColor Cyan
-
-try {
-    $Version = Invoke-RestMethod `
-        -Uri "${SonarBaseUrl}/api/server/version" `
-        -Method GET `
-        -Headers $Headers `
-        -ErrorAction Stop
-
-    Write-Host "SonarQube version: $Version" -ForegroundColor Green
-}
-catch {
-    throw "Cannot connect to SonarQube: $(Get-ErrorDescription -ErrorRecord $_)"
-}
-
-# ============================================================
-# 5. RETRIEVE ALL PROJECTS
-# ============================================================
-
-Write-Host "`nRetrieving SonarQube projects..." -ForegroundColor Cyan
-
+# Retrieve projects
 $Projects = [System.Collections.Generic.List[object]]::new()
 $Page = 1
 $Total = 0
 
 do {
-    $Uri = "${SonarBaseUrl}/api/projects/search?qualifiers=TRK&ps=${PageSize}&p=${Page}"
+    $uri = "${BaseUrl}/api/projects/search?qualifiers=TRK&ps=${PageSize}&p=${Page}"
 
-    try {
-        $Response = Invoke-RestMethod `
-            -Uri $Uri `
-            -Method GET `
-            -Headers $Headers `
-            -ErrorAction Stop
-    }
-    catch {
-        throw "Failed to retrieve projects, page ${Page}: $(Get-ErrorDescription -ErrorRecord $_)"
-    }
+    $response = Invoke-RestMethod `
+        -Uri $uri `
+        -Method GET `
+        -Headers $Headers `
+        -ErrorAction Stop
 
-    foreach ($Component in $Response.components) {
-        $Projects.Add($Component) | Out-Null
+    foreach ($project in $response.components) {
+        $Projects.Add($project) | Out-Null
     }
 
-    $Total = [int]$Response.paging.total
-
+    $Total = [int]$response.paging.total
     Write-Host "Retrieved $($Projects.Count) of $Total projects..."
-
     $Page++
 }
 while ($Projects.Count -lt $Total)
 
-Write-Host "`nTotal projects retrieved: $($Projects.Count)" -ForegroundColor Green
-
-# ============================================================
-# 6. CHECK BINDINGS
-# ============================================================
-
+# Check binding only
 $NoBinding = [System.Collections.Generic.List[object]]::new()
 $Errors = [System.Collections.Generic.List[object]]::new()
 
-$Counter = 0
 $BoundCount = 0
 $UnboundCount = 0
 $ErrorCount = 0
+$Counter = 0
 
-foreach ($Project in $Projects) {
+foreach ($project in $Projects) {
     $Counter++
 
-    $ProjectName = [string]$Project.name
-    $ProjectKey = [string]$Project.key
+    $name = [string]$project.name
+    $key = [string]$project.key
+    $encodedKey = [uri]::EscapeDataString($key)
+    $bindingUri = "${BaseUrl}/api/alm_settings/get_binding?project=${encodedKey}"
 
-    Write-Host "[$Counter/$($Projects.Count)] Checking $ProjectName" -ForegroundColor Cyan
-
-    $EncodedKey = [uri]::EscapeDataString($ProjectKey)
-    $BindingUri = "${SonarBaseUrl}/api/alm_settings/get_binding?project=${EncodedKey}"
+    Write-Host "[$Counter/$($Projects.Count)] $name" -ForegroundColor Cyan
 
     try {
-        $Binding = Invoke-RestMethod `
-            -Uri $BindingUri `
+        # Successful GET = binding exists.
+        $null = Invoke-RestMethod `
+            -Uri $bindingUri `
             -Method GET `
             -Headers $Headers `
             -ErrorAction Stop
 
-        # Successful GET means a binding exists.
         $BoundCount++
-
         Write-Host "  BOUND" -ForegroundColor Green
     }
     catch {
-        $StatusCode = Get-HttpStatusCode -ErrorRecord $_
-        $Reason = Get-ErrorDescription -ErrorRecord $_
+        $status = Get-HttpStatusCode -ErrorRecord $_
 
-        if ($StatusCode -eq 404) {
-            # SonarQube returns 404 when the project has no binding.
+        if ($status -eq 404) {
             $UnboundCount++
 
             $NoBinding.Add([PSCustomObject]@{
-                ProjectName = $ProjectName
-                ProjectKey  = $ProjectKey
-                Qualifier   = [string]$Project.qualifier
-                LastAnalysisDate = [string]$Project.lastAnalysisDate
-                Visibility  = [string]$Project.visibility
-                Status      = "NO_BINDING"
-                Reason      = "SonarQube returned HTTP 404 for get_binding."
+                ProjectName = $name
+                ProjectKey  = $key
             }) | Out-Null
 
-            Write-Host "  NO BINDING (HTTP 404)" -ForegroundColor Yellow
+            Write-Host "  NO BINDING" -ForegroundColor Yellow
         }
         else {
-            # Do not misclassify authentication/network errors as unbound.
             $ErrorCount++
 
-            Add-ErrorRow `
-                -ProjectName $ProjectName `
-                -ProjectKey $ProjectKey `
-                -Reason $Reason
+            $Errors.Add([PSCustomObject]@{
+                ProjectName = $name
+                ProjectKey  = $key
+                Error       = Get-ErrorText -ErrorRecord $_
+            }) | Out-Null
 
-            Write-Host "  CHECK ERROR: $Reason" -ForegroundColor Red
+            Write-Host "  CHECK ERROR: $(Get-ErrorText -ErrorRecord $_)" -ForegroundColor Red
         }
     }
 }
 
-# ============================================================
-# 7. EXPORT CSV REPORTS
-# ============================================================
+# Export only the required project list plus a separate errors report.
+$NoBinding | Export-Csv -Path $NoBindingCsv -NoTypeInformation -Encoding UTF8
+$Errors | Export-Csv -Path $ErrorsCsv -NoTypeInformation -Encoding UTF8
 
-$NoBinding |
-    Export-Csv `
-        -Path $NoBindingReportPath `
-        -NoTypeInformation `
-        -Encoding UTF8
-
-$Errors |
-    Export-Csv `
-        -Path $ErrorReportPath `
-        -NoTypeInformation `
-        -Encoding UTF8
-
-# ============================================================
-# 8. SUMMARY
-# ============================================================
-
-Write-Host "`n============================================================" -ForegroundColor Cyan
-Write-Host "SONARQUBE BINDING AUDIT SUMMARY" -ForegroundColor Cyan
-Write-Host "============================================================" -ForegroundColor Cyan
-
-Write-Host "SonarQube version:       $Version"
-Write-Host "Total projects:          $($Projects.Count)"
-Write-Host "Projects with binding:   $BoundCount"
-Write-Host "Projects without binding:$UnboundCount"
-Write-Host "Binding check errors:    $ErrorCount"
-
-Write-Host "`nProjects without binding CSV:" -ForegroundColor Yellow
-Write-Host $NoBindingReportPath
-
-Write-Host "`nBinding check errors CSV:" -ForegroundColor Yellow
-Write-Host $ErrorReportPath
-
-Write-Host "`nAudit completed. No SonarQube configuration was modified." -ForegroundColor Green
+Write-Host "`n========== SUMMARY ==========" -ForegroundColor Cyan
+Write-Host "Total projects:      $($Projects.Count)"
+Write-Host "With binding:        $BoundCount"
+Write-Host "Without binding:     $UnboundCount"
+Write-Host "Check errors:        $ErrorCount"
+Write-Host "`nProjects without binding:"
+Write-Host $NoBindingCsv
+Write-Host "`nCheck errors:"
+Write-Host $ErrorsCsv
+Write-Host "`nRead-only audit complete. No bindings were changed." -ForegroundColor Green
