@@ -1,6 +1,4 @@
-
 $baseUrl = "https://aas-sonar-pr.azure-paas.com"
-$projectKey = "aa-belgium-internal-Adhesions"
 $token = $env:SONARQUBE_TOKEN
 
 $b64 = [Convert]::ToBase64String(
@@ -12,21 +10,19 @@ $headers = @{
     Accept = "application/json"
 }
 
-$encodedKey = [Uri]::EscapeDataString($projectKey)
-$uri = "$baseUrl/api/alm_settings/get_binding?project=$encodedKey"
-
 try {
     $response = Invoke-RestMethod `
-        -Uri $uri `
+        -Uri "$baseUrl/api/system/info" `
         -Method GET `
         -Headers $headers `
         -ErrorAction Stop
 
-    $response | ConvertTo-Json -Depth 10
+    Write-Host "Version: $($response.System.Version)"
+    Write-Host "Edition: $($response.System.Edition)"
+    $response | ConvertTo-Json -Depth 5
 }
 catch {
-    Write-Host "HTTP/error: $($_.Exception.Message)" -ForegroundColor Yellow
-
+    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
     if ($_.ErrorDetails.Message) {
         Write-Host $_.ErrorDetails.Message
     }
