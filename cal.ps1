@@ -38,14 +38,13 @@ $headers = @{
     Accept        = "application/json"
 }
 
-# Preserve the TLS configuration used by your existing scripts.
 try {
     [Net.ServicePointManager]::SecurityProtocol =
         [Net.ServicePointManager]::SecurityProtocol -bor
         [Net.SecurityProtocolType]::Tls12
 }
 catch {
-    Write-Host "Warning: Could not explicitly configure TLS 1.2."
+    Write-Host "Warning: Could not configure TLS 1.2."
 }
 
 try {
@@ -53,11 +52,11 @@ try {
         [System.Net.CredentialCache]::DefaultNetworkCredentials
 }
 catch {
-    # No action required.
+    # Proxy configuration is optional.
 }
 
 # ------------------------------------------------------------
-# 3. Diagnostic helper
+# 3. Diagnostic function
 # ------------------------------------------------------------
 
 function Test-SonarEndpoint {
@@ -69,9 +68,9 @@ function Test-SonarEndpoint {
     $uri = "$script:BaseUrl$Path"
 
     Write-Host ""
-    Write-Host "========================================" -ForegroundColor DarkGray
+    Write-Host "==================================================" -ForegroundColor DarkGray
     Write-Host "Endpoint: $Path" -ForegroundColor Cyan
-    Write-Host "========================================" -ForegroundColor DarkGray
+    Write-Host "==================================================" -ForegroundColor DarkGray
 
     try {
         $response = Invoke-WebRequest `
@@ -90,18 +89,24 @@ function Test-SonarEndpoint {
 
         if ([string]::IsNullOrWhiteSpace($content)) {
             Write-Host "Response body is empty." -ForegroundColor Yellow
+            return
         }
-        else {
-            try {
-                $json = $content | ConvertFrom-Json -ErrorAction Stop
-                Write-Host "Response body (JSON):"
-                $json | ConvertTo-Json -Depth 15
-            }
-            catch {
-                Write-Host "Response body (text):"
-                Write-Host $content
-            }
+
+        Write-Host ""
+        Write-Host "----- FULL RESPONSE BODY -----" -ForegroundColor Yellow
+
+        try {
+            $json = $content | ConvertFrom-Json -ErrorAction Stop
+            $formattedJson = $json | ConvertTo-Json -Depth 30
+            Write-Output $formattedJson
         }
+        catch {
+            # Print the raw body if it is not valid JSON.
+            Write-Output $content
+        }
+
+        Write-Host ""
+        Write-Host "----- END RESPONSE BODY -----" -ForegroundColor Yellow
     }
     catch {
         Write-Host "Request failed." -ForegroundColor Red
@@ -109,12 +114,11 @@ function Test-SonarEndpoint {
 
         if ($_.Exception.Response) {
             try {
-                Write-Host (
-                    "HTTP status: {0}" -f
-                    [int]$_.Exception.Response.StatusCode
-                ) -ForegroundColor Yellow
+                $httpResponse = $_.Exception.Response
+                Write-Host "HTTP status: $([int]$httpResponse.StatusCode)" `
+                    -ForegroundColor Yellow
 
-                $stream = $_.Exception.Response.GetResponseStream()
+                $stream = $httpResponse.GetResponseStream()
 
                 if ($null -ne $stream) {
                     $reader = [System.IO.StreamReader]::new($stream)
@@ -123,8 +127,11 @@ function Test-SonarEndpoint {
                         $body = $reader.ReadToEnd()
 
                         if (-not [string]::IsNullOrWhiteSpace($body)) {
-                            Write-Host "Server response body:"
-                            Write-Host $body
+                            Write-Host "----- ERROR RESPONSE BODY -----" `
+                                -ForegroundColor Yellow
+                            Write-Output $body
+                            Write-Host "----- END ERROR BODY -----" `
+                                -ForegroundColor Yellow
                         }
                     }
                     finally {
@@ -140,7 +147,7 @@ function Test-SonarEndpoint {
         if ($_.ErrorDetails -and
             -not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
             Write-Host "Additional details:"
-            Write-Host $_.ErrorDetails.Message
+            Write-Output $_.ErrorDetails.Message
         }
     }
 }
@@ -153,15 +160,12 @@ Write-Host ""
 Write-Host "SonarQube API diagnostic" -ForegroundColor Cyan
 Write-Host "Base URL: $script:BaseUrl"
 Write-Host "Token configured: Yes"
-Write-Host "No configuration or binding changes will be made."
+Write-Host "Read-only mode: No changes will be made."
 
-# Known endpoint from your working script.
 Test-SonarEndpoint -Path "/api/server/version"
 
-# Known working API pattern for comparison.
 Test-SonarEndpoint -Path "/api/projects/search?ps=1&p=1"
 
-# ALM configuration endpoint under investigation.
 Test-SonarEndpoint -Path "/api/alm_settings/list_definitions"
 
 Write-Host ""
