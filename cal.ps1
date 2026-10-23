@@ -1,42 +1,59 @@
+
 $ErrorActionPreference = "Stop"
 
-$SonarQubeUrl = "https://aas-sonar-pr.azure-paas.com".TrimEnd("/")
-$Token = $env:SONARQUBE_TOKEN
+$baseUrl = "https://aas-sonar-pr.azure-paas.com"
+$token = $env:SONARQUBE_TOKEN
 
-if ([string]::IsNullOrWhiteSpace($Token)) {
-    throw "Define primero la variable SONARQUBE_TOKEN."
+if ([string]::IsNullOrWhiteSpace($token)) {
+    Write-Host "ERROR: SONARQUBE_TOKEN no está definida." -ForegroundColor Red
+    return
 }
 
-$basicAuth = [Convert]::ToBase64String(
-    [Text.Encoding]::ASCII.GetBytes("${Token}:")
+$encoded = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes("${token}:")
 )
 
 $headers = @{
-    Authorization = "Basic $basicAuth"
-    Accept        = "application/json"
+    Authorization = "Basic $encoded"
+    Accept = "application/json"
 }
 
-$uri = "$SonarQubeUrl/api/alm_settings/list_definitions"
+$endpoints = @(
+    "/api/server/version",
+    "/api/alm_settings/list_definitions"
+)
 
-try {
-    $response = Invoke-RestMethod `
-        -Uri $uri `
-        -Method Get `
-        -Headers $headers `
-        -TimeoutSec 60
+foreach ($endpoint in $endpoints) {
+    $uri = "$baseUrl$endpoint"
 
-    $response | ConvertTo-Json -Depth 10
+    Write-Host "`nConsultando: $endpoint" -ForegroundColor Cyan
 
-} catch {
-    Write-Host "Error consultando SonarQube:" -ForegroundColor Red
-    Write-Host $_.Exception.Message
+    try {
+        $response = Invoke-WebRequest `
+            -Uri $uri `
+            -Method Get `
+            -Headers $headers `
+            -TimeoutSec 30
 
-    if ($_.Exception.Response) {
-        Write-Host "HTTP Status: $([int]$_.Exception.Response.StatusCode)"
+        Write-Host "HTTP: $([int]$response.StatusCode)"
+        Write-Host "Longitud del contenido: $($response.Content.Length)"
+
+        if ([string]::IsNullOrWhiteSpace($response.Content)) {
+            Write-Host "El servidor devolvió un cuerpo vacío." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host $response.Content
+        }
     }
+    catch {
+        Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
 
-    if ($_.ErrorDetails.Message) {
-        Write-Host "Response body:"
-        Write-Host $_.ErrorDetails.Message
+        if ($_.Exception.Response) {
+            Write-Host "HTTP: $([int]$_.Exception.Response.StatusCode)"
+        }
+
+        if ($_.ErrorDetails.Message) {
+            Write-Host "Detalle: $($_.ErrorDetails.Message)"
+        }
     }
 }
