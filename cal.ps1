@@ -1,138 +1,653 @@
 
+[CmdletBinding()]
+param(
+    # Por defecto solo planifica y genera un informe.
+    # Para ejecutar cambios reales, utilizar -ApplyChanges.
+    [switch]$ApplyChanges,
+
+    # Tokens opcionales; si se omiten, se usan las variables de entorno.
+    [string]$SonarTokenOverride,
+
+    [string]$PatOverride
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# SonarQube configuration
-$baseUrl = "https://aas-sonar-pr.azure-paas.com".TrimEnd("/")
-$projectKey = "aa-belgium-internal-Adhesions"
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 
-# Azure DevOps configuration
-$almSetting = "Azure DevOps"
-$azureProject = "aa-belgium-internal"
-$repositoryName = "Adhesions"
-$monorepo = "false"
+$SonarBaseUrl = "https://aas-sonar-pr.azure-paas.com".TrimEnd("/")
+$AzureOrgName = "AASolutions"
+$AzureOrgUrl = "https://dev.azure.com/$AzureOrgName"
+$AlmSetting = "Azure DevOps"
+$PageSize = 500
+$Monorepo = "false"
 
-# Authentication
-$token = $env:SONARQUBE_TOKEN
-
-if ([string]::IsNullOrWhiteSpace($token)) {
-    throw "SONARQUBE_TOKEN no está definido."
+# Report is generated beside this script.
+$ReportDirectory = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($ReportDirectory)) {
+    $ReportDirectory = (Get-Location).Path
 }
 
-$basicAuth = [Convert]::ToBase64String(
-    [Text.Encoding]::ASCII.GetBytes("${token}:")
+$Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$ReportPath = Join-Path $ReportDirectory "ALM_Binding_Report_$Timestamp.csv"
+
+# ============================================================
+# 2. AUTHENTICATION
+# ============================================================
+
+# SonarQube: explicit override > environment variable.
+$SonarToken = $SonarTokenOverride
+if ([string]::IsNullOrWhiteSpace($SonarToken)) {
+    $SonarToken = $env:SONARQUBE_TOKEN
+}
+
+if ([string]::IsNullOrWhiteSpace($SonarToken)) {
+    throw "SonarQube token missing. Set SONARQUBE_TOKEN or pass -SonarTokenOverride."
+}
+
+# Azure DevOps: explicit override > AZDO_PAT > SYSTEM_ACCESSTOKEN.
+$AzureToken = $PatOverride
+
+if ([string]::IsNullOrWhiteSpace($AzureToken)) {
+    $AzureToken = $env:AZDO_PAT
+}
+
+if ([string]::IsNullOrWhiteSpace($AzureToken)) {
+    $AzureToken = $env:SYSTEM_ACCESSTOKEN
+}
+
+if ([string]::IsNullOrWhiteSpace($AzureToken)) {
+    throw "Azure DevOps token missing. Set AZDO_PAT, SYSTEM_ACCESSTOKEN, or pass -PatOverride."
+}
+
+# SonarQube Basic authentication: token:
+$SonarEncodedAuth = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes("${SonarToken}:")
 )
 
-$headers = @{
-    Authorization = "Basic $basicAuth"
+$SonarHeaders = @{
+    Authorization = "Basic $SonarEncodedAuth"
+    Accept        = "application/json"
+}
+
+# Azure DevOps Basic authentication: :PAT
+$AzureEncodedAuth = [Convert]::ToBase64String(
+    [Text.Encoding]::ASCII.GetBytes(":${AzureToken}")
+)
+
+$AzureHeaders = @{
+    Authorization = "Basic $AzureEncodedAuth"
     Accept        = "application/json"
 }
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$encodedProjectKey = [uri]::EscapeDataString($projectKey)
-$bindingUri = "$baseUrl/api/alm_settings/get_binding?project=$encodedProjectKey"
-$postUri = "$baseUrl/api/alm_settings/set_azure_binding"
-
-# 1. Check whether a binding already exists
-Write-Host "Checking existing binding..." -ForegroundColor Cyan
-
 try {
-    $existingBinding = Invoke-RestMethod `
-        -Uri $bindingUri `
-        -Method GET `
-        -Headers $headers `
-        -ErrorAction Stop
-
-    Write-Host "The project already has a binding. No changes made." `
-        -ForegroundColor Yellow
-
-    $existingBinding | ConvertTo-Json -Depth 10
-    return
+    if ([System.Net.WebRequest]::DefaultWebProxy) {
+        [System.Net.WebRequest]::DefaultWebProxy.Credentials =
+            [System.Net.CredentialCache]::DefaultCredentials
+    }
 }
 catch {
-    $statusCode = $null
+    # Ignore proxy configuration errors; requests will use defaults.
+}
 
-    if ($null -ne $_.Exception.Response) {
+# ============================================================
+# 3. HELPER FUNCTIONS
+# ============================================================
+
+function Get-HttpStatusCode {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $response = $ErrorRecord.Exception.Response
+
+    if ($null -eq $response) {
+        return $null
+    }
+
+    try {
+        return [int]$response.StatusCode
+    }
+    catch {
         try {
-            $statusCode = [int]$_.Exception.Response.StatusCode
+            return [int]$response.StatusCode.value__
         }
         catch {
-            $statusCode = $null
+            return $null
         }
     }
+}
 
-    if ($statusCode -ne 404) {
-        Write-Host "Could not confirm binding status." -ForegroundColor Red
-        Write-Host $_.Exception.Message
-        if ($_.ErrorDetails.Message) {
-            Write-Host $_.ErrorDetails.Message
-        }
-        throw "Aborting: POST will not be sent."
+function Get-ErrorDescription {
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $statusCode = Get-HttpStatusCode -ErrorRecord $ErrorRecord
+    $message = $ErrorRecord.Exception.Message
+
+    if ($ErrorRecord.ErrorDetails -and
+        -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+        $message += " | " + $ErrorRecord.ErrorDetails.Message
     }
 
-    Write-Host "No existing binding found (HTTP 404)." -ForegroundColor Yellow
-}
-
-# 2. Create the binding
-$body = @{
-    almSetting     = $almSetting
-    project        = $projectKey
-    projectName    = $azureProject
-    repositoryName = $repositoryName
-    monorepo       = $monorepo
-}
-
-Write-Host "`nCreating binding..." -ForegroundColor Cyan
-Write-Host "SonarQube project: $projectKey"
-Write-Host "Azure DevOps project: $azureProject"
-Write-Host "Azure DevOps repository: $repositoryName"
-
-try {
-    $result = Invoke-RestMethod `
-        -Uri $postUri `
-        -Method POST `
-        -Headers $headers `
-        -Body $body `
-        -ErrorAction Stop
-
-    Write-Host "POST completed." -ForegroundColor Green
-
-    if ($null -ne $result) {
-        $result | ConvertTo-Json -Depth 10
-    }
-}
-catch {
-    Write-Host "Binding creation failed." -ForegroundColor Red
-    Write-Host $_.Exception.Message
-
-    if ($_.ErrorDetails.Message) {
-        Write-Host "Server response:"
-        Write-Host $_.ErrorDetails.Message
+    if ($null -ne $statusCode) {
+        return "HTTP $statusCode : $message"
     }
 
-    throw
+    return "No HTTP status available: $message"
 }
 
-# 3. Verify the binding
-Write-Host "`nVerifying binding..." -ForegroundColor Cyan
+function Add-ReportRow {
+    param(
+        [Parameter(Mandatory)][string]$SonarName,
+        [Parameter(Mandatory)][string]$SonarKey,
+        [string]$AzureProject = "",
+        [string]$AzureRepository = "",
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][string]$Reason
+    )
 
-try {
-    $verified = Invoke-RestMethod `
-        -Uri $bindingUri `
+    $script:Report.Add([PSCustomObject]@{
+        SonarProjectName = $SonarName
+        SonarProjectKey  = $SonarKey
+        AzureProject     = $AzureProject
+        AzureRepository  = $AzureRepository
+        Status           = $Status
+        Reason           = $Reason
+    }) | Out-Null
+}
+
+function Get-AzureProject {
+    param(
+        [Parameter(Mandatory)][string]$ProjectName
+    )
+
+    $encodedName = [uri]::EscapeDataString($ProjectName)
+    $uri = "$script:AzureOrgUrl/_apis/projects/$encodedName?api-version=7.1"
+
+    return Invoke-RestMethod `
+        -Uri $uri `
         -Method GET `
-        -Headers $headers `
+        -Headers $script:AzureHeaders `
+        -ErrorAction Stop
+}
+
+function Get-AzureRepositories {
+    param(
+        [Parameter(Mandatory)][string]$ProjectId
+    )
+
+    $uri = "$script:AzureOrgUrl/$ProjectId/_apis/git/repositories?api-version=7.1"
+
+    return Invoke-RestMethod `
+        -Uri $uri `
+        -Method GET `
+        -Headers $script:AzureHeaders `
+        -ErrorAction Stop
+}
+
+function Get-SonarBinding {
+    param(
+        [Parameter(Mandatory)][string]$ProjectKey
+    )
+
+    $encodedKey = [uri]::EscapeDataString($ProjectKey)
+    $uri = "$script:SonarBaseUrl/api/alm_settings/get_binding?project=$encodedKey"
+
+    return Invoke-RestMethod `
+        -Uri $uri `
+        -Method GET `
+        -Headers $script:SonarHeaders `
+        -ErrorAction Stop
+}
+
+# ============================================================
+# 4. INITIALIZE REPORT AND MODE
+# ============================================================
+
+$Report = [System.Collections.Generic.List[object]]::new()
+
+if ($ApplyChanges) {
+    Write-Host "`nMODE: APPLY CHANGES" -ForegroundColor Red
+    Write-Host "Valid bindings will be created in SonarQube."
+}
+else {
+    Write-Host "`nMODE: DRY RUN / PLANNING" -ForegroundColor Cyan
+    Write-Host "No bindings will be created."
+    Write-Host "Use -ApplyChanges to execute the planned changes."
+}
+
+Write-Host "SonarQube: $SonarBaseUrl"
+Write-Host "Azure DevOps organization: $AzureOrgName"
+Write-Host "ALM setting: $AlmSetting"
+Write-Host "Report: $ReportPath"
+
+# ============================================================
+# 5. VERIFY CONNECTIVITY
+# ============================================================
+
+Write-Host "`nChecking SonarQube connectivity..." -ForegroundColor Cyan
+
+try {
+    $sonarVersion = Invoke-RestMethod `
+        -Uri "$SonarBaseUrl/api/server/version" `
+        -Method GET `
+        -Headers $SonarHeaders `
         -ErrorAction Stop
 
-    $verified | ConvertTo-Json -Depth 10
-    Write-Host "`nBinding verified successfully." -ForegroundColor Green
+    Write-Host "SonarQube version: $sonarVersion" -ForegroundColor Green
 }
 catch {
-    Write-Host "The POST completed, but verification failed." `
-        -ForegroundColor Yellow
-    Write-Host $_.Exception.Message
+    throw "Cannot connect to SonarQube: $(Get-ErrorDescription -ErrorRecord $_)"
+}
 
-    if ($_.ErrorDetails.Message) {
-        Write-Host $_.ErrorDetails.Message
+Write-Host "`nChecking Azure DevOps connectivity..." -ForegroundColor Cyan
+
+try {
+    $encodedOrg = [uri]::EscapeDataString($AzureOrgName)
+
+    $orgCheck = Invoke-RestMethod `
+        -Uri "$AzureOrgUrl/_apis/projects?`$top=1&api-version=7.1" `
+        -Method GET `
+        -Headers $AzureHeaders `
+        -ErrorAction Stop
+
+    Write-Host "Azure DevOps API is accessible." -ForegroundColor Green
+}
+catch {
+    throw "Cannot access Azure DevOps projects API: $(Get-ErrorDescription -ErrorRecord $_)"
+}
+
+# ============================================================
+# 6. RETRIEVE ALL SONARQUBE PROJECTS
+# ============================================================
+
+Write-Host "`nRetrieving SonarQube projects..." -ForegroundColor Cyan
+
+$SonarProjects = [System.Collections.Generic.List[object]]::new()
+$page = 1
+
+do {
+    $uri = "$SonarBaseUrl/api/projects/search?qualifiers=TRK&ps=$PageSize&p=$page"
+
+    try {
+        $response = Invoke-RestMethod `
+            -Uri $uri `
+            -Method GET `
+            -Headers $SonarHeaders `
+            -ErrorAction Stop
+    }
+    catch {
+        throw "Failed to retrieve SonarQube projects (page $page): $(Get-ErrorDescription -ErrorRecord $_)"
+    }
+
+    foreach ($component in $response.components) {
+        $SonarProjects.Add($component) | Out-Null
+    }
+
+    $total = [int]$response.paging.total
+    $retrieved = $page * $PageSize
+
+    Write-Host "Retrieved $($SonarProjects.Count) of $total projects..."
+
+    $page++
+}
+while ($retrieved -lt $total)
+
+Write-Host "`nTotal projects retrieved: $($SonarProjects.Count)" -ForegroundColor Green
+
+# ============================================================
+# 7. PROCESS PROJECTS
+# ============================================================
+
+$counter = 0
+$created = 0
+$verified = 0
+$existing = 0
+$invalid = 0
+$missingAzureProject = 0
+$missingRepository = 0
+$errors = 0
+$ready = 0
+
+foreach ($sonarProject in $SonarProjects) {
+    $counter++
+
+    $sonarName = [string]$sonarProject.name
+    $sonarKey = [string]$sonarProject.key
+
+    Write-Host "`n[$counter/$($SonarProjects.Count)] $sonarName" -ForegroundColor Cyan
+
+    # --------------------------------------------------------
+    # 7.1 Check whether a binding already exists.
+    # Existing bindings must never be changed by this script.
+    # --------------------------------------------------------
+
+    try {
+        $binding = Get-SonarBinding -ProjectKey $sonarKey
+
+        $existing++
+        Write-Host "SKIPPED: Binding already exists." -ForegroundColor Yellow
+
+        Add-ReportRow `
+            -SonarName $sonarName `
+            -SonarKey $sonarKey `
+            -Status "SKIPPED_EXISTING_BINDING" `
+            -Reason "Project already has an ALM binding; existing binding was preserved."
+
+        continue
+    }
+    catch {
+        $bindingStatus = Get-HttpStatusCode -ErrorRecord $_
+
+        if ($bindingStatus -ne 404) {
+            $errors++
+            $reason = Get-ErrorDescription -ErrorRecord $_
+
+            Write-Host "ERROR: Could not determine binding status: $reason" `
+                -ForegroundColor Red
+
+            Add-ReportRow `
+                -SonarName $sonarName `
+                -SonarKey $sonarKey `
+                -Status "ERROR_BINDING_CHECK" `
+                -Reason $reason
+
+            continue
+        }
+
+        # HTTP 404 is the expected response for an unbound project.
+    }
+
+    # --------------------------------------------------------
+    # 7.2 Parse SonarQube DISPLAY NAME using the LAST hyphen.
+    #
+    # Example:
+    # aa-belgium-internal-Adhesions
+    # Azure project    = aa-belgium-internal
+    # Azure repository = Adhesions
+    # --------------------------------------------------------
+
+    $lastHyphen = $sonarName.LastIndexOf("-")
+
+    if ($lastHyphen -le 0 -or $lastHyphen -ge ($sonarName.Length - 1)) {
+        $invalid++
+
+        $reason = "Naming convention invalid: project name must contain a non-empty Azure project name, a hyphen, and a non-empty repository name."
+
+        Write-Host "SKIPPED: $reason" -ForegroundColor Yellow
+
+        Add-ReportRow `
+            -SonarName $sonarName `
+            -SonarKey $sonarKey `
+            -Status "INVALID_NAMING_CONVENTION" `
+            -Reason $reason
+
+        continue
+    }
+
+    $azureProjectName = $sonarName.Substring(0, $lastHyphen).Trim()
+    $repositoryName = $sonarName.Substring($lastHyphen + 1).Trim()
+
+    if ([string]::IsNullOrWhiteSpace($azureProjectName) -or
+        [string]::IsNullOrWhiteSpace($repositoryName)) {
+
+        $invalid++
+
+        $reason = "Naming convention invalid: Azure project or repository name is empty after parsing."
+
+        Write-Host "SKIPPED: $reason" -ForegroundColor Yellow
+
+        Add-ReportRow `
+            -SonarName $sonarName `
+            -SonarKey $sonarKey `
+            -Status "INVALID_NAMING_CONVENTION" `
+            -Reason $reason
+
+        continue
+    }
+
+    Write-Host "Azure project candidate: $azureProjectName"
+    Write-Host "Repository candidate:    $repositoryName"
+
+    # --------------------------------------------------------
+    # 7.3 Verify that the Azure DevOps project exists.
+    # --------------------------------------------------------
+
+    try {
+        $azureProject = Get-AzureProject -ProjectName $azureProjectName
+    }
+    catch {
+        $statusCode = Get-HttpStatusCode -ErrorRecord $_
+        $reason = Get-ErrorDescription -ErrorRecord $_
+
+        if ($statusCode -eq 404) {
+            $missingAzureProject++
+
+            Write-Host "SKIPPED: Azure DevOps project not found." -ForegroundColor Yellow
+
+            Add-ReportRow `
+                -SonarName $sonarName `
+                -SonarKey $sonarKey `
+                -AzureProject $azureProjectName `
+                -AzureRepository $repositoryName `
+                -Status "AZDO_PROJECT_NOT_FOUND" `
+                -Reason "Azure DevOps project '$azureProjectName' was not found. $reason"
+        }
+        else {
+            $errors++
+
+            Write-Host "ERROR checking Azure project: $reason" -ForegroundColor Red
+
+            Add-ReportRow `
+                -SonarName $sonarName `
+                -SonarKey $sonarKey `
+                -AzureProject $azureProjectName `
+                -AzureRepository $repositoryName `
+                -Status "ERROR_AZDO_PROJECT_LOOKUP" `
+                -Reason $reason
+        }
+
+        continue
+    }
+
+    # Use the exact project name returned by Azure DevOps.
+    $azureProjectName = [string]$azureProject.name
+    $azureProjectId = [string]$azureProject.id
+
+    # --------------------------------------------------------
+    # 7.4 Verify that the repository exists in that project.
+    # --------------------------------------------------------
+
+    try {
+        $repositoriesResponse = Get-AzureRepositories -ProjectId $azureProjectId
+        $repositories = @($repositoriesResponse.value)
+
+        $repository = $repositories |
+            Where-Object { $_.name -ieq $repositoryName } |
+            Select-Object -First 1
+
+        if ($null -eq $repository) {
+            $missingRepository++
+
+            $reason = "Repository '$repositoryName' was not found in Azure DevOps project '$azureProjectName'."
+
+            Write-Host "SKIPPED: $reason" -ForegroundColor Yellow
+
+            Add-ReportRow `
+                -SonarName $sonarName `
+                -SonarKey $sonarKey `
+                -AzureProject $azureProjectName `
+                -AzureRepository $repositoryName `
+                -Status "AZDO_REPOSITORY_NOT_FOUND" `
+                -Reason $reason
+
+            continue
+        }
+
+        # Use the exact repository name returned by Azure DevOps.
+        $repositoryName = [string]$repository.name
+    }
+    catch {
+        $errors++
+        $reason = Get-ErrorDescription -ErrorRecord $_
+
+        Write-Host "ERROR checking Azure repositories: $reason" -ForegroundColor Red
+
+        Add-ReportRow `
+            -SonarName $sonarName `
+            -SonarKey $sonarKey `
+            -AzureProject $azureProjectName `
+            -AzureRepository $repositoryName `
+            -Status "ERROR_AZDO_REPOSITORY_LOOKUP" `
+            -Reason $reason
+
+        continue
+    }
+
+    # --------------------------------------------------------
+    # 7.5 Dry-run: report the validated candidate, no changes.
+    # --------------------------------------------------------
+
+    if (-not $ApplyChanges) {
+        $ready++
+
+        Write-Host "READY: Project and repository exist. No changes made." `
+            -ForegroundColor Green
+
+        Add-ReportRow `
+            -SonarName $sonarName `
+            -SonarKey $sonarKey `
+            -AzureProject $azureProjectName `
+            -AzureRepository $repositoryName `
+            -Status "READY_DRY_RUN" `
+            -Reason "Naming convention valid; Azure DevOps project and repository verified. Binding not created in dry-run mode."
+
+        continue
+    }
+
+    # --------------------------------------------------------
+    # 7.6 Apply: create binding only for validated, unbound items.
+    # --------------------------------------------------------
+
+    $body = @{
+        almSetting     = $AlmSetting
+        project        = $sonarKey
+        projectName    = $azureProjectName
+        repositoryName = $repositoryName
+        monorepo       = $Monorepo
+    }
+
+    try {
+        Write-Host "Creating binding..." -ForegroundColor Cyan
+
+        $null = Invoke-RestMethod `
+            -Uri "$SonarBaseUrl/api/alm_settings/set_azure_binding" `
+            -Method POST `
+            -Headers $SonarHeaders `
+            -Body $body `
+            -ErrorAction Stop
+
+        $created++
+
+        # ----------------------------------------------------
+        # 7.7 Verify the binding after creation.
+        # ----------------------------------------------------
+
+        try {
+            $verifiedBinding = Get-SonarBinding -ProjectKey $sonarKey
+
+            $verified++
+
+            Write-Host "SUCCESS: Binding created and verified." `
+                -ForegroundColor Green
+
+            Add-ReportRow `
+                -SonarName $sonarName `
+                -SonarKey $sonarKey `
+                -AzureProject $azureProjectName `
+                -AzureRepository $repositoryName `
+                -Status "BINDING_CREATED_VERIFIED" `
+                -Reason "Binding creation request succeeded and the binding was verified with GET."
+        }
+        catch {
+            $errors++
+            $reason = Get-ErrorDescription -ErrorRecord $_
+
+            Write-Host "WARNING: POST succeeded, but verification failed: $reason" `
+                -ForegroundColor Yellow
+
+            Add-ReportRow `
+                -SonarName $sonarName `
+                -SonarKey $sonarKey `
+                -AzureProject $azureProjectName `
+                -AzureRepository $repositoryName `
+                -Status "BINDING_VERIFICATION_FAILED" `
+                -Reason "POST succeeded, but GET verification failed. Check the binding manually. $reason"
+        }
+    }
+    catch {
+        $errors++
+        $reason = Get-ErrorDescription -ErrorRecord $_
+
+        Write-Host "ERROR creating binding: $reason" -ForegroundColor Red
+
+        Add-ReportRow `
+            -SonarName $sonarName `
+            -SonarKey $sonarKey `
+            -AzureProject $azureProjectName `
+            -AzureRepository $repositoryName `
+            -Status "BINDING_POST_FAILED" `
+            -Reason $reason
     }
 }
+
+# ============================================================
+# 8. EXPORT CSV REPORT
+# ============================================================
+
+$Report |
+    Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
+
+# ============================================================
+# 9. SUMMARY
+# ============================================================
+
+Write-Host "`n============================================================" -ForegroundColor Cyan
+Write-Host "BINDING PROCESS SUMMARY" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+
+Write-Host "Mode:                    $(if ($ApplyChanges) { 'APPLY CHANGES' } else { 'DRY RUN' })"
+Write-Host "SonarQube projects:      $($SonarProjects.Count)"
+Write-Host "Already bound / skipped: $existing"
+Write-Host "Invalid naming:          $invalid"
+Write-Host "Azure project missing:   $missingAzureProject"
+Write-Host "Azure repository missing:$missingRepository"
+
+if ($ApplyChanges) {
+    Write-Host "POST succeeded:          $created"
+    Write-Host "Bindings verified:       $verified"
+}
+
+Write-Host "Ready in dry-run:        $ready"
+Write-Host "Errors / warnings:       $errors"
+Write-Host "Report saved to:         $ReportPath"
+
+Write-Host "`nStatus counts:" -ForegroundColor Cyan
+
+$Report |
+    Group-Object -Property Status |
+    Sort-Object -Property Name |
+    ForEach-Object {
+        Write-Host ("{0,-32} {1,6}" -f $_.Name, $_.Count)
+    }
+
+Write-Host "`nProcess completed." -ForegroundColor Green
