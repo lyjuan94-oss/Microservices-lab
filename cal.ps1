@@ -97,7 +97,7 @@ function Get-HttpStatusCode {
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    # Some PowerShell/.NET exceptions do not expose Response.
+    # Response is not available on every exception type.
     $response = $null
 
     try {
@@ -114,7 +114,7 @@ function Get-HttpStatusCode {
             }
         }
         catch {
-            # Try alternative representations.
+            # Try another representation.
         }
 
         try {
@@ -127,7 +127,7 @@ function Get-HttpStatusCode {
         }
     }
 
-    # PowerShell 7 / HttpResponseException may expose StatusCode directly.
+    # Some PowerShell/.NET exceptions expose StatusCode directly.
     try {
         $statusCode = $ErrorRecord.Exception.StatusCode
         if ($null -ne $statusCode) {
@@ -138,7 +138,7 @@ function Get-HttpStatusCode {
         # Continue.
     }
 
-    # Inspect inner exception when present.
+    # Try the inner exception.
     try {
         $innerResponse = $ErrorRecord.Exception.InnerException.Response
         if ($null -ne $innerResponse.StatusCode) {
@@ -193,13 +193,16 @@ function Add-ReportRow {
     }) | Out-Null
 }
 
+# Corrected: delimit the variable before the query string.
 function Get-AzureProject {
     param(
-        [Parameter(Mandatory)][string]$ProjectName
+        [Parameter(Mandatory)]
+        [string]$ProjectName
     )
 
     $encodedName = [uri]::EscapeDataString($ProjectName)
-    $uri = "$script:AzureOrgUrl/_apis/projects/$encodedName?api-version=7.1"
+
+    $uri = "${script:AzureOrgUrl}/_apis/projects/${encodedName}?api-version=7.1"
 
     return Invoke-RestMethod `
         -Uri $uri `
@@ -210,10 +213,11 @@ function Get-AzureProject {
 
 function Get-AzureRepositories {
     param(
-        [Parameter(Mandatory)][string]$ProjectId
+        [Parameter(Mandatory)]
+        [string]$ProjectId
     )
 
-    $uri = "$script:AzureOrgUrl/$ProjectId/_apis/git/repositories?api-version=7.1"
+    $uri = "${script:AzureOrgUrl}/${ProjectId}/_apis/git/repositories?api-version=7.1"
 
     return Invoke-RestMethod `
         -Uri $uri `
@@ -224,11 +228,12 @@ function Get-AzureRepositories {
 
 function Get-SonarBinding {
     param(
-        [Parameter(Mandatory)][string]$ProjectKey
+        [Parameter(Mandatory)]
+        [string]$ProjectKey
     )
 
     $encodedKey = [uri]::EscapeDataString($ProjectKey)
-    $uri = "$script:SonarBaseUrl/api/alm_settings/get_binding?project=$encodedKey"
+    $uri = "${script:SonarBaseUrl}/api/alm_settings/get_binding?project=${encodedKey}"
 
     return Invoke-RestMethod `
         -Uri $uri `
@@ -250,7 +255,7 @@ if ($ApplyChanges) {
 else {
     Write-Host "`nMODE: DRY RUN / PLANNING" -ForegroundColor Cyan
     Write-Host "No bindings will be created."
-    Write-Host "Use -ApplyChanges to execute the planned changes."
+    Write-Host "Use -ApplyChanges only after reviewing the CSV."
 }
 
 Write-Host "SonarQube: $SonarBaseUrl"
@@ -266,7 +271,7 @@ Write-Host "`nChecking SonarQube connectivity..." -ForegroundColor Cyan
 
 try {
     $sonarVersion = Invoke-RestMethod `
-        -Uri "$SonarBaseUrl/api/server/version" `
+        -Uri "${SonarBaseUrl}/api/server/version" `
         -Method GET `
         -Headers $SonarHeaders `
         -ErrorAction Stop
@@ -281,7 +286,7 @@ Write-Host "`nChecking Azure DevOps connectivity..." -ForegroundColor Cyan
 
 try {
     $null = Invoke-RestMethod `
-        -Uri "$AzureOrgUrl/_apis/projects?%24top=1&api-version=7.1" `
+        -Uri "${AzureOrgUrl}/_apis/projects?%24top=1&api-version=7.1" `
         -Method GET `
         -Headers $AzureHeaders `
         -ErrorAction Stop
@@ -303,7 +308,7 @@ $page = 1
 $total = 0
 
 do {
-    $uri = "$SonarBaseUrl/api/projects/search?qualifiers=TRK&ps=$PageSize&p=$page"
+    $uri = "${SonarBaseUrl}/api/projects/search?qualifiers=TRK&ps=${PageSize}&p=${page}"
 
     try {
         $response = Invoke-RestMethod `
@@ -352,9 +357,9 @@ foreach ($sonarProject in $SonarProjects) {
 
     Write-Host "`n[$counter/$($SonarProjects.Count)] $sonarName" -ForegroundColor Cyan
 
-    # 7.1 Preserve existing bindings.
+    # 7.1 Check binding first; preserve existing bindings.
     try {
-        $binding = Get-SonarBinding -ProjectKey $sonarKey
+        $null = Get-SonarBinding -ProjectKey $sonarKey
 
         $existing++
         Write-Host "SKIPPED: Binding already exists." -ForegroundColor Yellow
@@ -386,7 +391,7 @@ foreach ($sonarProject in $SonarProjects) {
         }
     }
 
-    # 7.2 Split the DISPLAY NAME at its last hyphen.
+    # 7.2 Parse the SonarQube DISPLAY NAME at its last hyphen.
     $lastHyphen = $sonarName.LastIndexOf("-")
 
     if ($lastHyphen -le 0 -or $lastHyphen -ge ($sonarName.Length - 1)) {
@@ -468,7 +473,7 @@ foreach ($sonarProject in $SonarProjects) {
     $azureProjectName = [string]$azureProject.name
     $azureProjectId = [string]$azureProject.id
 
-    # 7.4 Verify repository exists in that project.
+    # 7.4 Verify repository exists inside that project.
     try {
         $repositoriesResponse = Get-AzureRepositories -ProjectId $azureProjectId
         $repositories = @($repositoriesResponse.value)
@@ -513,7 +518,7 @@ foreach ($sonarProject in $SonarProjects) {
         continue
     }
 
-    # 7.5 Dry run: no modifications.
+    # 7.5 Dry-run: validated candidate, no changes.
     if (-not $ApplyChanges) {
         $ready++
 
@@ -530,7 +535,7 @@ foreach ($sonarProject in $SonarProjects) {
         continue
     }
 
-    # 7.6 Create binding only after all checks pass.
+    # 7.6 Create binding only for validated, unbound projects.
     $body = @{
         almSetting     = $AlmSetting
         project        = $sonarKey
@@ -543,7 +548,7 @@ foreach ($sonarProject in $SonarProjects) {
         Write-Host "Creating binding..." -ForegroundColor Cyan
 
         $null = Invoke-RestMethod `
-            -Uri "$SonarBaseUrl/api/alm_settings/set_azure_binding" `
+            -Uri "${SonarBaseUrl}/api/alm_settings/set_azure_binding" `
             -Method POST `
             -Headers $SonarHeaders `
             -Body $body `
@@ -551,9 +556,9 @@ foreach ($sonarProject in $SonarProjects) {
 
         $created++
 
-        # Verify the binding after creation.
+        # 7.7 Verify binding after creation.
         try {
-            $verifiedBinding = Get-SonarBinding -ProjectKey $sonarKey
+            $null = Get-SonarBinding -ProjectKey $sonarKey
             $verified++
 
             Write-Host "SUCCESS: Binding created and verified." -ForegroundColor Green
@@ -612,21 +617,21 @@ Write-Host "`n============================================================" -For
 Write-Host "BINDING PROCESS SUMMARY" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
-Write-Host "Mode:                    $(if ($ApplyChanges) { 'APPLY CHANGES' } else { 'DRY RUN' })"
-Write-Host "SonarQube projects:      $($SonarProjects.Count)"
-Write-Host "Already bound / skipped: $existing"
-Write-Host "Invalid naming:          $invalid"
-Write-Host "Azure project missing:  $missingAzureProject"
+Write-Host "Mode:                     $(if ($ApplyChanges) { 'APPLY CHANGES' } else { 'DRY RUN' })"
+Write-Host "SonarQube projects:       $($SonarProjects.Count)"
+Write-Host "Already bound / skipped:  $existing"
+Write-Host "Invalid naming:           $invalid"
+Write-Host "Azure project missing:    $missingAzureProject"
 Write-Host "Azure repository missing: $missingRepository"
 
 if ($ApplyChanges) {
-    Write-Host "POST succeeded:          $created"
-    Write-Host "Bindings verified:       $verified"
+    Write-Host "POST succeeded:           $created"
+    Write-Host "Bindings verified:        $verified"
 }
 
-Write-Host "Ready in dry-run:        $ready"
-Write-Host "Errors / warnings:       $errors"
-Write-Host "Report saved to:         $ReportPath"
+Write-Host "Ready in dry-run:         $ready"
+Write-Host "Errors / warnings:        $errors"
+Write-Host "Report saved to:          $ReportPath"
 
 Write-Host "`nStatus counts:" -ForegroundColor Cyan
 
