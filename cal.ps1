@@ -2,18 +2,21 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ============================================================
-# Configuration
-# ============================================================
-
+# SonarQube configuration
 $baseUrl = "https://aas-sonar-pr.azure-paas.com".TrimEnd("/")
 $projectKey = "aa-belgium-internal-Adhesions"
 
-# Authentication: SonarQube token
+# Azure DevOps configuration
+$almSetting = "Azure DevOps"
+$azureProject = "aa-belgium-internal"
+$repositoryName = "Adhesions"
+$monorepo = "false"
+
+# Authentication
 $token = $env:SONARQUBE_TOKEN
 
 if ([string]::IsNullOrWhiteSpace($token)) {
-    throw "SONARQUBE_TOKEN no está definido en las variables de entorno."
+    throw "SONARQUBE_TOKEN no está definido."
 }
 
 $basicAuth = [Convert]::ToBase64String(
@@ -25,178 +28,111 @@ $headers = @{
     Accept        = "application/json"
 }
 
-# TLS 1.2
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# ============================================================
-# Helper: display HTTP and connection errors
-# ============================================================
-
-function Show-RequestError {
-    param(
-        [Parameter(Mandatory)]
-        [System.Management.Automation.ErrorRecord]$ErrorRecord
-    )
-
-    Write-Host "`n--- Error details ---" -ForegroundColor Red
-    Write-Host "Message: $($ErrorRecord.Exception.Message)"
-
-    $response = $ErrorRecord.Exception.Response
-
-    if ($null -ne $response) {
-        try {
-            $statusCode = [int]$response.StatusCode
-            Write-Host "HTTP status: $statusCode"
-
-            if ($response.ReasonPhrase) {
-                Write-Host "Reason: $($response.ReasonPhrase)"
-            }
-        }
-        catch {
-            Write-Host "No se pudo leer el código HTTP."
-        }
-
-        # Read response body when available (.NET response types vary)
-        try {
-            if ($response -is [System.Net.Http.HttpResponseMessage]) {
-                $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-                if (-not [string]::IsNullOrWhiteSpace($body)) {
-                    Write-Host "Response body:"
-                    Write-Host $body
-                }
-            }
-            elseif ($response -is [System.Net.HttpWebResponse]) {
-                $reader = [System.IO.StreamReader]::new($response.GetResponseStream())
-                try {
-                    $body = $reader.ReadToEnd()
-                    if (-not [string]::IsNullOrWhiteSpace($body)) {
-                        Write-Host "Response body:"
-                        Write-Host $body
-                    }
-                }
-                finally {
-                    $reader.Dispose()
-                }
-            }
-        }
-        catch {
-            Write-Host "No se pudo leer el cuerpo de la respuesta."
-        }
-    }
-    else {
-        Write-Host "HTTP status: unavailable (no HTTP response received)"
-    }
-
-    if ($ErrorRecord.ErrorDetails -and
-        -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
-        Write-Host "PowerShell error details:"
-        Write-Host $ErrorRecord.ErrorDetails.Message
-    }
-
-    Write-Host "Category: $($ErrorRecord.CategoryInfo.Category)"
-    Write-Host "FullyQualifiedErrorId: $($ErrorRecord.FullyQualifiedErrorId)"
-}
-
-# ============================================================
-# 1. Check SonarQube server version
-# ============================================================
-
-Write-Host "`n[1/3] Checking SonarQube server..." -ForegroundColor Cyan
-
-try {
-    $version = Invoke-RestMethod `
-        -Uri "$baseUrl/api/server/version" `
-        -Method GET `
-        -Headers $headers `
-        -ErrorAction Stop
-
-    Write-Host "SonarQube version: $version" -ForegroundColor Green
-}
-catch {
-    Show-RequestError -ErrorRecord $_
-    Write-Host "No se puede continuar sin confirmar la conexión."
-    return
-}
-
-# ============================================================
-# 2. Confirm the project exists
-# ============================================================
-
-Write-Host "`n[2/3] Checking SonarQube project..." -ForegroundColor Cyan
-
 $encodedProjectKey = [uri]::EscapeDataString($projectKey)
-$projectUri = "$baseUrl/api/projects/search?projects=$encodedProjectKey"
-
-try {
-    $projectResult = Invoke-RestMethod `
-        -Uri $projectUri `
-        -Method GET `
-        -Headers $headers `
-        -ErrorAction Stop
-
-    $project = $projectResult.components |
-        Where-Object { $_.key -eq $projectKey } |
-        Select-Object -First 1
-
-    if ($null -eq $project) {
-        Write-Host "Project not found: $projectKey" -ForegroundColor Red
-        Write-Host "No se realizarán cambios."
-        return
-    }
-
-    Write-Host "Project found." -ForegroundColor Green
-    Write-Host "Name: $($project.name)"
-    Write-Host "Key:  $($project.key)"
-}
-catch {
-    Show-RequestError -ErrorRecord $_
-    Write-Host "No se pudo comprobar el proyecto. No se realizarán cambios."
-    return
-}
-
-# ============================================================
-# 3. Diagnose the existing Azure DevOps binding
-# ============================================================
-
-Write-Host "`n[3/3] Checking Azure DevOps binding..." -ForegroundColor Cyan
-
 $bindingUri = "$baseUrl/api/alm_settings/get_binding?project=$encodedProjectKey"
+$postUri = "$baseUrl/api/alm_settings/set_azure_binding"
+
+# 1. Check whether a binding already exists
+Write-Host "Checking existing binding..." -ForegroundColor Cyan
 
 try {
-    $binding = Invoke-RestMethod `
+    $existingBinding = Invoke-RestMethod `
         -Uri $bindingUri `
         -Method GET `
         -Headers $headers `
         -ErrorAction Stop
 
-    Write-Host "`nThe project already has a binding:" -ForegroundColor Green
-    $binding | ConvertTo-Json -Depth 10
+    Write-Host "The project already has a binding. No changes made." `
+        -ForegroundColor Yellow
 
-    Write-Host "`nDiagnostic finished. No changes were made."
+    $existingBinding | ConvertTo-Json -Depth 10
+    return
 }
 catch {
-    $response = $_.Exception.Response
     $statusCode = $null
 
-    if ($null -ne $response) {
+    if ($null -ne $_.Exception.Response) {
         try {
-            $statusCode = [int]$response.StatusCode
+            $statusCode = [int]$_.Exception.Response.StatusCode
         }
         catch {
             $statusCode = $null
         }
     }
 
-    if ($statusCode -eq 404) {
-        Write-Host "`nSonarQube returned HTTP 404 for the binding." -ForegroundColor Yellow
-        Write-Host "The project may not have an Azure DevOps binding."
-        Write-Host "No POST request was sent."
+    if ($statusCode -ne 404) {
+        Write-Host "Could not confirm binding status." -ForegroundColor Red
+        Write-Host $_.Exception.Message
+        if ($_.ErrorDetails.Message) {
+            Write-Host $_.ErrorDetails.Message
+        }
+        throw "Aborting: POST will not be sent."
     }
-    else {
-        Show-RequestError -ErrorRecord $_
-        Write-Host "`nThe binding status could not be confirmed."
-        Write-Host "No POST request was sent."
-    }
+
+    Write-Host "No existing binding found (HTTP 404)." -ForegroundColor Yellow
 }
 
-Write-Host "`nDiagnostic complete. This script did not modify any bindings." -ForegroundColor Cyan
+# 2. Create the binding
+$body = @{
+    almSetting     = $almSetting
+    project        = $projectKey
+    projectName    = $azureProject
+    repositoryName = $repositoryName
+    monorepo       = $monorepo
+}
+
+Write-Host "`nCreating binding..." -ForegroundColor Cyan
+Write-Host "SonarQube project: $projectKey"
+Write-Host "Azure DevOps project: $azureProject"
+Write-Host "Azure DevOps repository: $repositoryName"
+
+try {
+    $result = Invoke-RestMethod `
+        -Uri $postUri `
+        -Method POST `
+        -Headers $headers `
+        -Body $body `
+        -ErrorAction Stop
+
+    Write-Host "POST completed." -ForegroundColor Green
+
+    if ($null -ne $result) {
+        $result | ConvertTo-Json -Depth 10
+    }
+}
+catch {
+    Write-Host "Binding creation failed." -ForegroundColor Red
+    Write-Host $_.Exception.Message
+
+    if ($_.ErrorDetails.Message) {
+        Write-Host "Server response:"
+        Write-Host $_.ErrorDetails.Message
+    }
+
+    throw
+}
+
+# 3. Verify the binding
+Write-Host "`nVerifying binding..." -ForegroundColor Cyan
+
+try {
+    $verified = Invoke-RestMethod `
+        -Uri $bindingUri `
+        -Method GET `
+        -Headers $headers `
+        -ErrorAction Stop
+
+    $verified | ConvertTo-Json -Depth 10
+    Write-Host "`nBinding verified successfully." -ForegroundColor Green
+}
+catch {
+    Write-Host "The POST completed, but verification failed." `
+        -ForegroundColor Yellow
+    Write-Host $_.Exception.Message
+
+    if ($_.ErrorDetails.Message) {
+        Write-Host $_.ErrorDetails.Message
+    }
+}
