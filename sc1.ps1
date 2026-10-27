@@ -1,24 +1,23 @@
 
 # ============================================================
-# SonarQube Project Key Search Across Azure DevOps
+# SonarQube Project Key Search in Azure DevOps YAML Files
 #
 # Scope:
 #   All projects and Git repositories in the AASolutions
 #   organization.
 #
 # Search method:
-#   1. Load SonarQube project keys from CSV.
+#   1. Load SonarQube project keys from the input CSV.
 #   2. Enumerate Azure DevOps projects and Git repositories.
 #   3. List repository files recursively.
-#   4. Retrieve candidate text/configuration files.
-#   5. Search file contents for SonarQube project keys.
+#   4. Download only .yml and .yaml files.
+#   5. Search YAML content for SonarQube project keys.
 #
 # READ-ONLY:
 #   No pipelines are executed.
 #   No SonarQube bindings are created or modified.
 #
 # Required environment variables:
-#   SONARQUBE_TOKEN
 #   AZDO_PAT or SYSTEM_ACCESSTOKEN
 #
 # Input:
@@ -26,16 +25,15 @@
 #
 # Output:
 #   Sonar_AzDO_File_Search_Results.csv
+#   Sonar_AzDO_File_Search_Errors.csv
 # ============================================================
 
 [CmdletBinding()]
 param(
     [string]$InputCsv = (Join-Path $PSScriptRoot "Sonar_Projects_Without_Binding.csv"),
-
     [string]$OutputCsv = (Join-Path $PSScriptRoot "Sonar_AzDO_File_Search_Results.csv"),
-
+    [string]$ErrorsCsv = (Join-Path $PSScriptRoot "Sonar_AzDO_File_Search_Errors.csv"),
     [string]$Organization = "AASolutions",
-
     [int]$RequestDelayMilliseconds = 0
 )
 
@@ -70,193 +68,191 @@ $AzureHeaders = @{
     Accept        = "application/json"
 }
 
-# Search common pipeline, source-code and configuration file types.
-# This avoids downloading obvious binary files and unrelated assets.
-$SearchExtensions = @(
-    ".yml",
-    ".yaml",
-    ".json",
-    ".tf",
-    ".tfvars",
-    ".ps1",
-    ".psm1",
-    ".sh",
-    ".bash",
-    ".properties",
-    ".xml",
-    ".config",
-    ".toml",
-    ".ini",
-    ".py",
-    ".js",
-    ".ts",
-    ".cs",
-    ".gradle",
-    ".groovy",
-    ".txt",
-    ".md",
-    ".sql",
-    ".env",
-    ".dockerfile"
-)
+# Only these extensions will be downloaded and searched.
+$SearchExtensions = @(".yml", ".yaml")
 
 # ------------------------------------------------------------
-# Utility functions
+# Helper functions
 # ------------------------------------------------------------
 
 function ConvertTo-EncodedSegment {
-    param([Parameter(Mandatory)][string]$Value)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Value
+    )
 
     return [Uri]::EscapeDataString($Value)
 }
 
 function Get-ObjectProperty {
     param(
-        [AllowNull()][object]$Object,
-        [Parameter(Mandatory)][string]$Name
+        [Parameter(Mandatory = $true)]
+        [object]$Object,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Name
     )
 
     if ($null -eq $Object) {
         return $null
     }
 
-    $property = $Object.PSObject.Properties[$Name]
+    if ($Object -is [System.Collections.IDictionary]) {
+        return $Object[$Name]
+    }
 
-    if ($null -ne $property) {
-        return $property.Value
+    $Property = $Object.PSObject.Properties[$Name]
+
+    if ($null -ne $Property) {
+        return $Property.Value
     }
 
     return $null
 }
 
 function Invoke-AzureGet {
-    param([Parameter(Mandatory)][string]$Uri)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Url,
+
+        [switch]$RawResponse
+    )
 
     if ($RequestDelayMilliseconds -gt 0) {
         Start-Sleep -Milliseconds $RequestDelayMilliseconds
     }
 
-    return Invoke-RestMethod `
-        -Method Get `
-        -Uri $Uri `
-        -Headers $AzureHeaders `
-        -ErrorAction Stop
+    try {
+        if ($RawResponse) {
+            return Invoke-WebRequest `
+                -Uri $Url `
+                -Headers $AzureHeaders `
+                -Method Get `
+                -UseBasicParsing
+        }
+
+        return Invoke-RestMethod `
+            -Uri $Url `
+            -Headers $AzureHeaders `
+            -Method Get
+    }
+    catch {
+        throw "Azure DevOps request failed. URL: $Url. Error: $($_.Exception.Message)"
+    }
 }
 
 function Import-ProjectsCsv {
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
 
-    foreach ($delimiter in @(",", ";", "`t")) {
-        try {
-            $rows = @(Import-Csv -LiteralPath $Path -Delimiter $delimiter -ErrorAction Stop)
+    $Rows = @(Import-Csv -LiteralPath $Path)
 
-            if ($rows.Count -eq 0) {
-                continue
-            }
-
-            $headers = @($rows[0].PSObject.Properties.Name)
-
-            $nameHeader = $headers |
-                Where-Object {
-                    $_.Trim().TrimStart([char]0xFEFF) -ieq "ProjectName"
-                } |
-                Select-Object -First 1
-
-            $keyHeader = $headers |
-                Where-Object {
-                    $_.Trim().TrimStart([char]0xFEFF) -ieq "ProjectKey"
-                } |
-                Select-Object -First 1
-
-            if (-not $keyHeader) {
-                continue
-            }
-
-            $projects = foreach ($row in $rows) {
-                $key = ([string](
-                    Get-ObjectProperty -Object $row -Name $keyHeader
-                )).Trim()
-
-                $name = ""
-
-                if ($nameHeader) {
-                    $name = ([string](
-                        Get-ObjectProperty -Object $row -Name $nameHeader
-                    )).Trim()
-                }
-
-                if (-not [string]::IsNullOrWhiteSpace($key)) {
-                    [PSCustomObject]@{
-                        ProjectName = $name
-                        ProjectKey  = $key
-                    }
-                }
-            }
-
-            return @($projects)
-        }
-        catch {
-            # Try the next delimiter.
-        }
+    if ($Rows.Count -eq 0) {
+        throw "The input CSV contains no project keys."
     }
 
-    throw "Could not read the CSV. A ProjectKey column is required."
+    $FirstRow = $Rows[0]
+
+    if (
+        $null -eq $FirstRow.PSObject.Properties["ProjectKey"] -or
+        $null -eq $FirstRow.PSObject.Properties["ProjectName"]
+    ) {
+        throw "The input CSV must contain ProjectKey and ProjectName columns."
+    }
+
+    $Projects = @(
+        foreach ($Row in $Rows) {
+            $Key = ([string]$Row.ProjectKey).Trim()
+
+            if (-not [string]::IsNullOrWhiteSpace($Key)) {
+                [PSCustomObject]@{
+                    ProjectKey  = $Key
+                    ProjectName = ([string]$Row.ProjectName).Trim()
+                }
+            }
+        }
+    )
+
+    if ($Projects.Count -eq 0) {
+        throw "No valid ProjectKey values were found in the input CSV."
+    }
+
+    return $Projects
 }
 
-# ------------------------------------------------------------
-# Azure DevOps API functions
-# ------------------------------------------------------------
-
 function Get-AzureProjects {
-    $uri = "$AzureBaseUrl/_apis/projects?`$top=1000&api-version=7.1"
+    $Url = "$AzureBaseUrl/_apis/projects?`$top=1000&api-version=7.1"
+    $Response = Invoke-AzureGet -Url $Url
 
-    $response = Invoke-AzureGet -Uri $uri
-
-    return @($response.value)
+    return @($Response.value)
 }
 
 function Get-AzureRepositories {
-    param([Parameter(Mandatory)][string]$ProjectName)
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectName
+    )
 
-    $encodedProject = ConvertTo-EncodedSegment -Value $ProjectName
+    $EncodedProject = ConvertTo-EncodedSegment -Value $ProjectName
 
-    $uri = "$AzureBaseUrl/$encodedProject/_apis/git/repositories?api-version=7.1"
+    $Url = "$AzureBaseUrl/$EncodedProject/_apis/git/repositories?api-version=7.1"
+    $Response = Invoke-AzureGet -Url $Url
 
-    $response = Invoke-AzureGet -Uri $uri
-
-    return @($response.value)
+    return @($Response.value)
 }
 
 function Get-RepositoryFiles {
     param(
-        [Parameter(Mandatory)][string]$ProjectName,
-        [Parameter(Mandatory)][string]$RepositoryId
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RepositoryId
     )
 
-    $encodedProject = ConvertTo-EncodedSegment -Value $ProjectName
-    $encodedRepository = ConvertTo-EncodedSegment -Value $RepositoryId
+    $EncodedProject = ConvertTo-EncodedSegment -Value $ProjectName
+    $EncodedRepository = ConvertTo-EncodedSegment -Value $RepositoryId
 
-    $uri = "$AzureBaseUrl/$encodedProject/_apis/git/repositories/$encodedRepository/items?recursionLevel=Full&includeContentMetadata=true&api-version=7.1"
+    $Url = "$AzureBaseUrl/$EncodedProject/_apis/git/repositories/$EncodedRepository/items?recursionLevel=Full&includeContentMetadata=true&api-version=7.1"
 
-    $response = Invoke-AzureGet -Uri $uri
+    $Response = Invoke-AzureGet -Url $Url
 
-    return @($response.value)
+    return @($Response.value)
 }
 
 function Get-RepositoryFileContent {
     param(
-        [Parameter(Mandatory)][string]$ProjectName,
-        [Parameter(Mandatory)][string]$RepositoryId,
-        [Parameter(Mandatory)][string]$FilePath
+        [Parameter(Mandatory = $true)]
+        [string]$ProjectName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RepositoryId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath
     )
 
-    $encodedProject = ConvertTo-EncodedSegment -Value $ProjectName
-    $encodedRepository = ConvertTo-EncodedSegment -Value $RepositoryId
-    $encodedPath = ConvertTo-EncodedSegment -Value $FilePath
+    $EncodedProject = ConvertTo-EncodedSegment -Value $ProjectName
+    $EncodedRepository = ConvertTo-EncodedSegment -Value $RepositoryId
+    $EncodedPath = ConvertTo-EncodedSegment -Value $FilePath
 
-    $uri = "$AzureBaseUrl/$encodedProject/_apis/git/repositories/$encodedRepository/items?path=$encodedPath&includeContent=true&api-version=7.1"
+    $Url = "$AzureBaseUrl/$EncodedProject/_apis/git/repositories/$EncodedRepository/items?path=$EncodedPath&includeContent=true&api-version=7.1"
 
-    return Invoke-AzureGet -Uri $uri
+    $Response = Invoke-AzureGet -Url $Url
+
+    if ($Response -is [string]) {
+        return $Response
+    }
+
+    $Content = Get-ObjectProperty -Object $Response -Name "content"
+
+    if ($null -ne $Content) {
+        return [string]$Content
+    }
+
+    throw "The Azure DevOps response did not contain file content."
 }
 
 # ------------------------------------------------------------
@@ -264,304 +260,228 @@ function Get-RepositoryFileContent {
 # ------------------------------------------------------------
 
 Write-Host ""
-Write-Host "============================================================"
-Write-Host "Azure DevOps Repository File Search"
-Write-Host "============================================================"
-Write-Host ""
+Write-Host "Loading SonarQube project keys..." -ForegroundColor Cyan
 
 $SonarProjects = @(Import-ProjectsCsv -Path $InputCsv)
 
-if ($SonarProjects.Count -eq 0) {
-    throw "No SonarQube project keys were found in the input CSV."
-}
-
-# Remove duplicate keys while preserving the first occurrence.
-$UniqueProjects = @(
-    $SonarProjects |
-        Group-Object -Property ProjectKey |
-        ForEach-Object { $_.Group[0] }
-)
-
-$SonarProjects = $UniqueProjects
-
-Write-Host "Input CSV: $InputCsv"
-Write-Host "Unique SonarQube project keys: $($SonarProjects.Count)"
-Write-Host "Azure DevOps organization: $Organization"
-Write-Host "Search extensions: $($SearchExtensions -join ', ')"
+Write-Host "SonarQube projects to search: $($SonarProjects.Count)"
 
 # ------------------------------------------------------------
-# Retrieve organization projects
-# ------------------------------------------------------------
-
-Write-Host ""
-Write-Host "Retrieving Azure DevOps projects..."
-
-$AzureProjects = @(Get-AzureProjects)
-
-Write-Host "Projects found: $($AzureProjects.Count)"
-
-# ------------------------------------------------------------
-# Search repositories
+# Search Azure DevOps YAML files
 # ------------------------------------------------------------
 
 $Results = [System.Collections.Generic.List[object]]::new()
-$SearchErrors = [System.Collections.Generic.List[object]]::new()
+$Errors = [System.Collections.Generic.List[object]]::new()
 
-$RepositoryCount = 0
-$FilesListedCount = 0
-$FilesScannedCount = 0
-$FilesMatchedCount = 0
+$Projects = @(Get-AzureProjects)
 
-foreach ($azureProject in $AzureProjects) {
-    $azureProjectName = [string](
-        Get-ObjectProperty -Object $azureProject -Name "name"
-    )
+Write-Host "Azure DevOps projects found: $($Projects.Count)" -ForegroundColor Cyan
+Write-Host "Searching only .yml and .yaml files." -ForegroundColor Cyan
+Write-Host ""
 
-    if ([string]::IsNullOrWhiteSpace($azureProjectName)) {
-        continue
-    }
+$TotalRepositories = 0
+$TotalYamlFiles = 0
+$TotalMatches = 0
+$CurrentProject = 0
 
-    Write-Host ""
-    Write-Host "Scanning project: $azureProjectName"
+foreach ($AzureProject in $Projects) {
+    $CurrentProject++
+
+    $AzureProjectName = [string]$AzureProject.name
+    $AzureProjectId = [string]$AzureProject.id
+
+    Write-Host "[$CurrentProject/$($Projects.Count)] Project: $AzureProjectName" -ForegroundColor Yellow
 
     try {
-        $repositories = @(Get-AzureRepositories -ProjectName $azureProjectName)
+        $Repositories = @(Get-AzureRepositories -ProjectName $AzureProjectName)
     }
     catch {
-        $SearchErrors.Add([PSCustomObject]@{
-            ProjectName    = $azureProjectName
-            RepositoryName = ""
-            FilePath       = ""
-            Stage          = "ListRepositories"
-            Error          = $_.Exception.Message
+        $Errors.Add([PSCustomObject]@{
+            AzureProjectName = $AzureProjectName
+            RepositoryName   = ""
+            FilePath         = ""
+            Error            = $_.Exception.Message
         })
 
-        Write-Warning "Could not list repositories in '$azureProjectName': $($_.Exception.Message)"
+        Write-Warning "Could not list repositories for project '$AzureProjectName'."
         continue
     }
 
-    foreach ($repository in $repositories) {
-        $repositoryId = [string](
-            Get-ObjectProperty -Object $repository -Name "id"
-        )
+    foreach ($Repository in $Repositories) {
+        $RepositoryName = [string]$Repository.name
+        $RepositoryId = [string]$Repository.id
 
-        $repositoryName = [string](
-            Get-ObjectProperty -Object $repository -Name "name"
-        )
+        $TotalRepositories++
 
-        if ([string]::IsNullOrWhiteSpace($repositoryId)) {
-            continue
-        }
-
-        $RepositoryCount++
-
-        Write-Host "  Repository: $repositoryName"
+        Write-Host "  Repository: $RepositoryName"
 
         try {
-            $items = @(Get-RepositoryFiles `
-                -ProjectName $azureProjectName `
-                -RepositoryId $repositoryId)
-
-            $FilesListedCount += $items.Count
+            $Files = @(Get-RepositoryFiles `
+                -ProjectName $AzureProjectName `
+                -RepositoryId $RepositoryId)
         }
         catch {
-            $SearchErrors.Add([PSCustomObject]@{
-                ProjectName    = $azureProjectName
-                RepositoryName = $repositoryName
-                FilePath       = ""
-                Stage          = "ListFiles"
-                Error          = $_.Exception.Message
+            $Errors.Add([PSCustomObject]@{
+                AzureProjectName = $AzureProjectName
+                RepositoryName   = $RepositoryName
+                FilePath         = ""
+                Error            = $_.Exception.Message
             })
 
-            Write-Warning "Could not list files in '$azureProjectName / $repositoryName': $($_.Exception.Message)"
+            Write-Warning "Could not list files in repository '$RepositoryName'."
             continue
         }
 
-        # Keep only file objects with supported text extensions.
-        $candidateFiles = @(
-            $items | Where-Object {
-                $item = $_
+        # Keep only YAML files; ignore folders and other file types.
+        $YamlFiles = @(
+            foreach ($File in $Files) {
+                $FilePath = [string]$File.path
+                $IsFolder = [bool](Get-ObjectProperty -Object $File -Name "isFolder")
 
-                $isFolder = Get-ObjectProperty -Object $item -Name "isFolder"
-                $path = [string](Get-ObjectProperty -Object $item -Name "path")
-                $objectType = [string](Get-ObjectProperty -Object $item -Name "gitObjectType")
-
-                if ($isFolder -eq $true -or $objectType -eq "tree") {
-                    return $false
-                }
-
-                if ([string]::IsNullOrWhiteSpace($path)) {
-                    return $false
-                }
-
-                $fileName = [System.IO.Path]::GetFileName($path)
-                $extension = [System.IO.Path]::GetExtension($fileName).ToLowerInvariant()
-
-                if ($SearchExtensions -contains $extension) {
-                    return $true
-                }
-
-                # Handle extensionless environment and Docker files.
-                if ($fileName -ieq "Dockerfile" -or $fileName -ieq ".env") {
-                    return $true
-                }
-
-                return $false
-            }
-        )
-
-        Write-Host "    Candidate text files: $($candidateFiles.Count)"
-
-        foreach ($file in $candidateFiles) {
-            $filePath = [string](
-                Get-ObjectProperty -Object $file -Name "path"
-            )
-
-            $contentMetadata = Get-ObjectProperty -Object $file -Name "contentMetadata"
-            $isBinary = Get-ObjectProperty -Object $contentMetadata -Name "isBinary"
-
-            if ($isBinary -eq $true) {
-                continue
-            }
-
-            try {
-                $fileResponse = Get-RepositoryFileContent `
-                    -ProjectName $azureProjectName `
-                    -RepositoryId $repositoryId `
-                    -FilePath $filePath
-
-                $content = [string](
-                    Get-ObjectProperty -Object $fileResponse -Name "content"
-                )
-
-                $FilesScannedCount++
-
-                if ([string]::IsNullOrEmpty($content)) {
+                if ($IsFolder -or [string]::IsNullOrWhiteSpace($FilePath)) {
                     continue
                 }
 
-                # Search every key against this file's content.
-                foreach ($sonarProject in $SonarProjects) {
-                    $key = $sonarProject.ProjectKey
+                $Extension = [System.IO.Path]::GetExtension($FilePath)
 
-                    if (
-                        $content.IndexOf(
-                            $key,
-                            [System.StringComparison]::OrdinalIgnoreCase
-                        ) -ge 0
-                    ) {
-                        $FilesMatchedCount++
-
-                        $Results.Add([PSCustomObject]@{
-                            ProjectKey      = $key
-                            SonarProjectName = $sonarProject.ProjectName
-                            AzureProjectName = $azureProjectName
-                            AzureProjectId   = [string](
-                                Get-ObjectProperty -Object $azureProject -Name "id"
-                            )
-                            RepositoryName   = $repositoryName
-                            RepositoryId     = $repositoryId
-                            FilePath         = $filePath
-                            MatchStatus      = "MatchFound"
-                            Approved         = "NO"
-                            Notes            = "The key was found in the retrieved file content. Verify the repository before creating a binding."
-                        })
-                    }
+                if ($SearchExtensions -contains $Extension.ToLowerInvariant()) {
+                    $File
                 }
             }
+        )
+
+        foreach ($File in $YamlFiles) {
+            $FilePath = [string]$File.path
+            $TotalYamlFiles++
+
+            try {
+                $Content = Get-RepositoryFileContent `
+                    -ProjectName $AzureProjectName `
+                    -RepositoryId $RepositoryId `
+                    -FilePath $FilePath
+            }
             catch {
-                $SearchErrors.Add([PSCustomObject]@{
-                    ProjectName    = $azureProjectName
-                    RepositoryName = $repositoryName
-                    FilePath       = $filePath
-                    Stage          = "ReadFile"
-                    Error          = $_.Exception.Message
+                $Errors.Add([PSCustomObject]@{
+                    AzureProjectName = $AzureProjectName
+                    RepositoryName   = $RepositoryName
+                    FilePath         = $FilePath
+                    Error            = $_.Exception.Message
                 })
 
-                Write-Warning "Could not read file '$azureProjectName / $repositoryName / $filePath': $($_.Exception.Message)"
+                continue
+            }
+
+            # Search every SonarQube key in this YAML file.
+            foreach ($SonarProject in $SonarProjects) {
+                $Key = [string]$SonarProject.ProjectKey
+
+                if ($Content.IndexOf(
+                    $Key,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -ge 0) {
+                    $TotalMatches++
+
+                    $Results.Add([PSCustomObject]@{
+                        ProjectKey       = $Key
+                        SonarProjectName = $SonarProject.ProjectName
+                        AzureProjectName = $AzureProjectName
+                        AzureProjectId   = $AzureProjectId
+                        RepositoryName   = $RepositoryName
+                        RepositoryId     = $RepositoryId
+                        FilePath         = $FilePath
+                        MatchStatus      = "Match"
+                        Approved         = ""
+                        Notes            = "Project key found in YAML file content. Binding not modified."
+                    })
+
+                    Write-Host "    MATCH: $Key -> $FilePath" -ForegroundColor Green
+                }
             }
         }
     }
 }
 
 # ------------------------------------------------------------
-# Add a result for keys with no match
+# Add explicit NoMatch rows for keys not found
 # ------------------------------------------------------------
 
-$MatchedKeys = @(
-    $Results |
-        Select-Object -ExpandProperty ProjectKey -Unique
-)
+$MatchedKeys = @{}
 
-foreach ($sonarProject in $SonarProjects) {
-    if ($MatchedKeys -notcontains $sonarProject.ProjectKey) {
+foreach ($Result in $Results) {
+    $MatchedKeys[$Result.ProjectKey.ToLowerInvariant()] = $true
+}
+
+foreach ($SonarProject in $SonarProjects) {
+    $Key = [string]$SonarProject.ProjectKey
+
+    if (-not $MatchedKeys.ContainsKey($Key.ToLowerInvariant())) {
         $Results.Add([PSCustomObject]@{
-            ProjectKey       = $sonarProject.ProjectKey
-            SonarProjectName = $sonarProject.ProjectName
+            ProjectKey       = $Key
+            SonarProjectName = $SonarProject.ProjectName
             AzureProjectName = ""
             AzureProjectId   = ""
             RepositoryName   = ""
             RepositoryId     = ""
             FilePath         = ""
             MatchStatus      = "NoMatch"
-            Approved         = "NO"
-            Notes            = "No match was found in the supported file types that were successfully scanned. Review search errors before concluding that the key is absent."
+            Approved         = ""
+            Notes            = "Key was not found in the YAML files that were successfully scanned. Check the error CSV before concluding that no match exists."
         })
     }
 }
 
 # ------------------------------------------------------------
-# Export search results
+# Export results
 # ------------------------------------------------------------
 
 $Results |
     Sort-Object ProjectKey, AzureProjectName, RepositoryName, FilePath |
-    Export-Csv `
-        -LiteralPath $OutputCsv `
-        -NoTypeInformation `
-        -Encoding UTF8
+    Export-Csv -LiteralPath $OutputCsv -NoTypeInformation -Encoding UTF8
 
-# Export errors separately for troubleshooting.
-$ErrorCsv = [System.IO.Path]::Combine(
-    [System.IO.Path]::GetDirectoryName($OutputCsv),
-    "Sonar_AzDO_File_Search_Errors.csv"
-)
-
-$SearchErrors |
-    Export-Csv `
-        -LiteralPath $ErrorCsv `
-        -NoTypeInformation `
-        -Encoding UTF8
+if ($Errors.Count -gt 0) {
+    $Errors |
+        Export-Csv -LiteralPath $ErrorsCsv -NoTypeInformation -Encoding UTF8
+}
+else {
+    @(
+        [PSCustomObject]@{
+            AzureProjectName = ""
+            RepositoryName   = ""
+            FilePath         = ""
+            Error            = "No errors were recorded."
+        }
+    ) | Export-Csv -LiteralPath $ErrorsCsv -NoTypeInformation -Encoding UTF8
+}
 
 # ------------------------------------------------------------
 # Summary
 # ------------------------------------------------------------
 
-$MatchedKeyCount = @(
+$UniqueMatchedKeys = @(
     $Results |
-        Where-Object { $_.MatchStatus -eq "MatchFound" } |
+        Where-Object { $_.MatchStatus -eq "Match" } |
         Select-Object -ExpandProperty ProjectKey -Unique
 ).Count
 
-$UnmatchedKeyCount = @(
+$NoMatchCount = @(
     $Results |
         Where-Object { $_.MatchStatus -eq "NoMatch" }
 ).Count
 
 Write-Host ""
-Write-Host "============================================================"
-Write-Host "Search completed"
-Write-Host "============================================================"
-Write-Host "Azure DevOps projects processed: $($AzureProjects.Count)"
-Write-Host "Repositories processed: $RepositoryCount"
-Write-Host "Repository items listed: $FilesListedCount"
-Write-Host "Files scanned: $FilesScannedCount"
-Write-Host "Matching file/key pairs: $FilesMatchedCount"
-Write-Host "SonarQube keys with matches: $MatchedKeyCount"
-Write-Host "SonarQube keys without matches: $UnmatchedKeyCount"
-Write-Host "Search errors: $($SearchErrors.Count)"
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "SEARCH COMPLETED" -ForegroundColor Cyan
+Write-Host "============================================================" -ForegroundColor Cyan
+Write-Host "SonarQube keys loaded:      $($SonarProjects.Count)"
+Write-Host "Azure DevOps projects:      $($Projects.Count)"
+Write-Host "Repositories scanned:       $TotalRepositories"
+Write-Host "YAML files inspected:       $TotalYamlFiles"
+Write-Host "Unique keys matched:        $UniqueMatchedKeys"
+Write-Host "Keys without a match:       $NoMatchCount"
+Write-Host "Total file matches:         $TotalMatches"
+Write-Host "Errors recorded:            $($Errors.Count)"
 Write-Host ""
-Write-Host "Search results: $OutputCsv"
-Write-Host "Search errors: $ErrorCsv"
+Write-Host "Results CSV: $OutputCsv" -ForegroundColor Green
+Write-Host "Errors CSV:  $ErrorsCsv" -ForegroundColor Green
 Write-Host ""
-Write-Host "No SonarQube bindings were created or modified."
+Write-Host "This script did not create or modify any SonarQube bindings."
