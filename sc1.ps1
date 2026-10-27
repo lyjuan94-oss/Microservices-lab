@@ -1,10 +1,14 @@
 
 # ============================================================
 # SonarQube to Azure DevOps Binding Discovery
-# Method: Azure DevOps Pipeline Preview API
+# Method:
+#   1. Retrieve Azure DevOps pipeline inventory.
+#   2. Retrieve build definition metadata.
+#   3. Request expanded YAML through the Pipeline Preview API.
+#   4. Match SonarQube project keys against expanded YAML.
 #
-# This script is READ-ONLY.
-# It does not create, update, or delete SonarQube bindings.
+# READ-ONLY:
+#   This script does not create, update, or delete bindings.
 #
 # Required environment variables:
 #   SONARQUBE_TOKEN
@@ -23,7 +27,6 @@ param(
     [string]$OutputCsv = (Join-Path $PSScriptRoot "Sonar_AzDO_Binding_Discovery.csv"),
     [string]$SonarUrl = "https://aas-sonar-pr.azure-paas.com",
     [string]$Organization = "AASolutions",
-    [string]$AlmSettingName = "Azure DevOps",
     [int]$RequestDelayMilliseconds = 0
 )
 
@@ -230,7 +233,7 @@ function Get-SonarBindingState {
 }
 
 # ------------------------------------------------------------
-# Azure DevOps discovery
+# Azure DevOps inventory
 # ------------------------------------------------------------
 
 function Get-AzureProjects {
@@ -251,6 +254,7 @@ function Get-AzurePipelines {
     return @($response.value)
 }
 
+# Uses the Build Definitions API to retrieve repository and YAML metadata.
 function Get-PipelineDetails {
     param(
         [Parameter(Mandatory)][string]$ProjectId,
@@ -258,13 +262,14 @@ function Get-PipelineDetails {
     )
 
     $encodedProjectId = ConvertTo-EncodedSegment -Value $ProjectId
-    $uri = "$AzureBaseUrl/$encodedProjectId/_apis/pipelines/$PipelineId?api-version=7.1"
+
+    $uri = "$AzureBaseUrl/$encodedProjectId/_apis/build/definitions/$PipelineId?api-version=7.1"
 
     return Invoke-AzureGet -Uri $uri
 }
 
 # ------------------------------------------------------------
-# Updated preview function with HTTP response diagnostics
+# Pipeline Preview API with detailed HTTP diagnostics
 # ------------------------------------------------------------
 
 function Get-PipelinePreview {
@@ -273,7 +278,7 @@ function Get-PipelinePreview {
         [Parameter(Mandatory)][string]$PipelineId
     )
 
-    $encodedProjectId = [Uri]::EscapeDataString($ProjectId)
+    $encodedProjectId = ConvertTo-EncodedSegment -Value $ProjectId
     $uri = "$AzureBaseUrl/$encodedProjectId/_apis/pipelines/$PipelineId/preview?api-version=7.1"
 
     $body = @{
@@ -294,17 +299,8 @@ function Get-PipelinePreview {
             -ErrorAction Stop
     }
     catch {
-        $statusCode = $null
+        $statusCode = Get-HttpStatusCode -ErrorRecord $_
         $responseBody = $null
-
-        try {
-            if ($null -ne $_.Exception.Response.StatusCode) {
-                $statusCode = [int]$_.Exception.Response.StatusCode
-            }
-        }
-        catch {
-            $statusCode = "Unknown"
-        }
 
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
             $responseBody = $_.ErrorDetails.Message
@@ -330,6 +326,57 @@ function Get-PipelinePreview {
         }
 
         throw "Pipeline preview failed. ProjectId='$ProjectId'; PipelineId='$PipelineId'; HTTP=$statusCode; Details=$responseBody"
+    }
+}
+
+# ------------------------------------------------------------
+# Extract repository and YAML metadata
+# Supports Build Definition API response format.
+# ------------------------------------------------------------
+
+function Get-RepositoryMetadata {
+    param([AllowNull()][object]$Definition)
+
+    $repository = Get-ObjectProperty -Object $Definition -Name "repository"
+    $process = Get-ObjectProperty -Object $Definition -Name "process"
+
+    $repositoryId = [string](Get-ObjectProperty -Object $repository -Name "id")
+    $repositoryName = [string](Get-ObjectProperty -Object $repository -Name "name")
+    $repositoryType = [string](Get-ObjectProperty -Object $repository -Name "type")
+
+    $yamlPath = [string](Get-ObjectProperty -Object $process -Name "yamlFilename")
+    $processType = Get-ObjectProperty -Object $process -Name "type"
+
+    $configurationType = "unknown"
+
+    # Build definition process type 2 represents YAML.
+    if ($null -ne $processType -and [string]$processType -eq "2") {
+        $configurationType = "yaml"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($yamlPath)) {
+        $configurationType = "yaml"
+    }
+
+    # Some API responses may expose pipeline configuration instead.
+    if ([string]::IsNullOrWhiteSpace($repositoryId)) {
+        $configuration = Get-ObjectProperty -Object $Definition -Name "configuration"
+        $configurationRepository = Get-ObjectProperty -Object $configuration -Name "repository"
+
+        $repositoryId = [string](Get-ObjectProperty -Object $configurationRepository -Name "id")
+        $repositoryName = [string](Get-ObjectProperty -Object $configurationRepository -Name "name")
+        $yamlPath = [string](Get-ObjectProperty -Object $configuration -Name "path")
+
+        if ((Get-ObjectProperty -Object $configuration -Name "type") -eq "yaml") {
+            $configurationType = "yaml"
+        }
+    }
+
+    return [PSCustomObject]@{
+        RepositoryId = $repositoryId
+        RepositoryName = $repositoryName
+        RepositoryType = $repositoryType
+        YamlPath = $yamlPath
+        ConfigurationType = $configurationType
     }
 }
 
@@ -386,20 +433,6 @@ function Get-YamlEvidence {
     return ""
 }
 
-function Get-RepositoryMetadata {
-    param([AllowNull()][object]$PipelineDetails)
-
-    $configuration = Get-ObjectProperty -Object $PipelineDetails -Name "configuration"
-    $repository = Get-ObjectProperty -Object $configuration -Name "repository"
-
-    return [PSCustomObject]@{
-        RepositoryId = [string](Get-ObjectProperty -Object $repository -Name "id")
-        RepositoryName = [string](Get-ObjectProperty -Object $repository -Name "name")
-        YamlPath = [string](Get-ObjectProperty -Object $configuration -Name "path")
-        ConfigurationType = [string](Get-ObjectProperty -Object $configuration -Name "type")
-    }
-}
-
 # ------------------------------------------------------------
 # Load SonarQube projects
 # ------------------------------------------------------------
@@ -431,14 +464,14 @@ $AzureProjects = @(Get-AzureProjects)
 Write-Host "Azure DevOps projects found: $($AzureProjects.Count)"
 
 # ------------------------------------------------------------
-# Inventory pipelines and request expanded YAML previews
+# Inventory YAML pipelines and retrieve previews
 # ------------------------------------------------------------
 
 $PipelineInventory = [System.Collections.Generic.List[object]]::new()
-$PipelineCounter = 0
 $PreviewErrorCount = 0
+$MetadataErrorCount = 0
 $NonYamlCount = 0
-$ProjectScanCounter = 0
+$PipelineCounter = 0
 
 foreach ($azureProject in $AzureProjects) {
     $azureProjectId = [string](Get-ObjectProperty -Object $azureProject -Name "id")
@@ -448,7 +481,6 @@ foreach ($azureProject in $AzureProjects) {
         continue
     }
 
-    $ProjectScanCounter++
     Write-Host ""
     Write-Host "Scanning Azure DevOps project: $azureProjectName"
 
@@ -470,21 +502,27 @@ foreach ($azureProject in $AzureProjects) {
 
         $PipelineCounter++
 
-        $details = $null
+        $definition = $null
+        $metadata = $null
+        $metadataStatus = "Success"
+        $metadataError = ""
 
         try {
-            $details = Get-PipelineDetails `
+            $definition = Get-PipelineDetails `
                 -ProjectId $azureProjectId `
                 -PipelineId $pipelineId
+
+            $metadata = Get-RepositoryMetadata -Definition $definition
         }
         catch {
-            Write-Warning "Could not retrieve details for pipeline '$pipelineName' ($pipelineId): $($_.Exception.Message)"
-        }
+            $metadataStatus = "MetadataError"
+            $metadataError = $_.Exception.Message
+            $MetadataErrorCount++
 
-        $metadata = Get-RepositoryMetadata -PipelineDetails $details
+            Write-Warning "Could not retrieve build definition for '$azureProjectName / $pipelineName' ($pipelineId): $metadataError"
 
-        if ($metadata.ConfigurationType -ne "yaml") {
-            $metadata = Get-RepositoryMetadata -PipelineDetails $pipeline
+            # Continue using the pipeline list object if it exposes metadata.
+            $metadata = Get-RepositoryMetadata -Definition $pipeline
         }
 
         if ($metadata.ConfigurationType -ne "yaml") {
@@ -526,8 +564,11 @@ foreach ($azureProject in $AzureProjects) {
             PipelineId = $pipelineId
             RepositoryName = $metadata.RepositoryName
             RepositoryId = $metadata.RepositoryId
+            RepositoryType = $metadata.RepositoryType
             YamlPath = $metadata.YamlPath
             ConfigurationType = $metadata.ConfigurationType
+            MetadataStatus = $metadataStatus
+            MetadataError = $metadataError
             PreviewStatus = $previewStatus
             PreviewError = $previewError
             FinalYaml = $previewYaml
@@ -537,12 +578,14 @@ foreach ($azureProject in $AzureProjects) {
 
 Write-Host ""
 Write-Host "Pipeline inventory completed."
-Write-Host "YAML pipelines inventoried: $($PipelineInventory.Count)"
-Write-Host "Non-YAML pipelines skipped: $NonYamlCount"
+Write-Host "Pipeline records processed: $PipelineCounter"
+Write-Host "YAML pipeline records inventoried: $($PipelineInventory.Count)"
+Write-Host "Non-YAML or unrecognized pipelines skipped: $NonYamlCount"
+Write-Host "Metadata retrieval errors: $MetadataErrorCount"
 Write-Host "Preview errors or empty previews: $PreviewErrorCount"
 
 # ------------------------------------------------------------
-# Match SonarQube projects against expanded YAML
+# Match SonarQube project keys against expanded YAML
 # ------------------------------------------------------------
 
 $Results = [System.Collections.Generic.List[object]]::new()
@@ -572,6 +615,7 @@ foreach ($sonarProject in $SonarProjects) {
             AzureProjectId = ""
             RepositoryName = ""
             RepositoryId = ""
+            RepositoryType = ""
             PipelineName = ""
             PipelineId = ""
             YamlPath = ""
@@ -595,6 +639,7 @@ foreach ($sonarProject in $SonarProjects) {
             AzureProjectId = ""
             RepositoryName = ""
             RepositoryId = ""
+            RepositoryType = ""
             PipelineName = ""
             PipelineId = ""
             YamlPath = ""
@@ -631,6 +676,7 @@ foreach ($sonarProject in $SonarProjects) {
                 AzureProjectId = $inventoryItem.AzureProjectId
                 RepositoryName = $inventoryItem.RepositoryName
                 RepositoryId = $inventoryItem.RepositoryId
+                RepositoryType = $inventoryItem.RepositoryType
                 PipelineName = $inventoryItem.PipelineName
                 PipelineId = $inventoryItem.PipelineId
                 YamlPath = $inventoryItem.YamlPath
@@ -639,9 +685,13 @@ foreach ($sonarProject in $SonarProjects) {
         }
     }
 
+    # Multiple pipelines from the same repository count as one candidate.
     $repositoryGroups = @(
         $matches | Group-Object -Property {
-            if (-not [string]::IsNullOrWhiteSpace($_.RepositoryId)) {
+            if (
+                -not [string]::IsNullOrWhiteSpace($_.RepositoryId) -and
+                -not [string]::IsNullOrWhiteSpace($_.AzureProjectId)
+            ) {
                 "$($_.AzureProjectId)|$($_.RepositoryId)"
             }
             else {
@@ -672,6 +722,7 @@ foreach ($sonarProject in $SonarProjects) {
             AzureProjectId = ""
             RepositoryName = ""
             RepositoryId = ""
+            RepositoryType = ""
             PipelineName = ""
             PipelineId = ""
             YamlPath = ""
@@ -726,6 +777,11 @@ foreach ($sonarProject in $SonarProjects) {
                 Where-Object { $_ } | Select-Object -Unique
         )
 
+        $repositoryTypes = @(
+            $groupMatches | ForEach-Object { $_.RepositoryType } |
+                Where-Object { $_ } | Select-Object -Unique
+        )
+
         $Results.Add([PSCustomObject]@{
             ProjectName = $projectName
             ProjectKey = $projectKey
@@ -736,6 +792,7 @@ foreach ($sonarProject in $SonarProjects) {
             AzureProjectId = $firstMatch.AzureProjectId
             RepositoryName = $firstMatch.RepositoryName
             RepositoryId = $firstMatch.RepositoryId
+            RepositoryType = ($repositoryTypes -join " | ")
             PipelineName = ($pipelineNames -join " | ")
             PipelineId = ($pipelineIds -join " | ")
             YamlPath = ($yamlPaths -join " | ")
@@ -764,10 +821,12 @@ Write-Host "============================================================"
 Write-Host "Discovery completed"
 Write-Host "============================================================"
 Write-Host "SonarQube projects processed: $($SonarProjects.Count)"
-Write-Host "Pipeline previews inventoried: $($PipelineInventory.Count)"
+Write-Host "Pipeline records processed: $PipelineCounter"
+Write-Host "YAML pipeline records inventoried: $($PipelineInventory.Count)"
+Write-Host "Metadata retrieval errors: $MetadataErrorCount"
 Write-Host "Preview errors or empty previews: $PreviewErrorCount"
 Write-Host "Results exported to: $OutputCsv"
 Write-Host ""
-Write-Host "Review MatchStatus before approving any candidate."
+Write-Host "All candidates require manual review."
 Write-Host "Approved is set to NO for every row."
 Write-Host "No SonarQube bindings were created or modified."
