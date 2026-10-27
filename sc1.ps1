@@ -20,22 +20,17 @@
 [CmdletBinding()]
 param(
     [string]$InputCsv = (Join-Path $PSScriptRoot "Sonar_Projects_Without_Binding.csv"),
-
     [string]$OutputCsv = (Join-Path $PSScriptRoot "Sonar_AzDO_Binding_Discovery.csv"),
-
     [string]$SonarUrl = "https://aas-sonar-pr.azure-paas.com",
-
     [string]$Organization = "AASolutions",
-
     [string]$AlmSettingName = "Azure DevOps",
-
     [int]$RequestDelayMilliseconds = 0
 )
 
 $ErrorActionPreference = "Stop"
 
 # ------------------------------------------------------------
-# Configuration and authentication
+# Authentication
 # ------------------------------------------------------------
 
 $SonarToken = $env:SONARQUBE_TOKEN
@@ -152,7 +147,6 @@ function Import-ProjectsCsv {
 
             $headers = @($rows[0].PSObject.Properties.Name)
 
-            # Remove a possible UTF-8 BOM and surrounding whitespace.
             $normalizedHeaders = @(
                 $headers | ForEach-Object {
                     $_.Trim().TrimStart([char]0xFEFF)
@@ -182,9 +176,11 @@ function Import-ProjectsCsv {
                 }
             }
 
-            return @($normalizedRows | Where-Object {
-                -not [string]::IsNullOrWhiteSpace($_.ProjectKey)
-            })
+            return @(
+                $normalizedRows | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_.ProjectKey)
+                }
+            )
         }
         catch {
             # Try the next delimiter.
@@ -193,6 +189,10 @@ function Import-ProjectsCsv {
 
     throw "Could not import the CSV. Required columns are ProjectName and ProjectKey. Supported delimiters are comma, semicolon, and tab."
 }
+
+# ------------------------------------------------------------
+# SonarQube binding verification
+# ------------------------------------------------------------
 
 function Get-SonarBindingState {
     param([Parameter(Mandatory)][string]$ProjectKey)
@@ -229,6 +229,10 @@ function Get-SonarBindingState {
     }
 }
 
+# ------------------------------------------------------------
+# Azure DevOps discovery
+# ------------------------------------------------------------
+
 function Get-AzureProjects {
     $uri = "$AzureBaseUrl/_apis/projects?`$top=1000&api-version=7.1"
     $response = Invoke-AzureGet -Uri $uri
@@ -243,6 +247,7 @@ function Get-AzurePipelines {
     $uri = "$AzureBaseUrl/$encodedProjectId/_apis/pipelines?`$top=1000&api-version=7.1"
 
     $response = Invoke-AzureGet -Uri $uri
+
     return @($response.value)
 }
 
@@ -253,11 +258,14 @@ function Get-PipelineDetails {
     )
 
     $encodedProjectId = ConvertTo-EncodedSegment -Value $ProjectId
-    $uri = "$AzureBaseUrl/$encodedProjectId/_apis/pipelines/$PipelineId" +
-           "?api-version=7.1"
+    $uri = "$AzureBaseUrl/$encodedProjectId/_apis/pipelines/$PipelineId?api-version=7.1"
 
     return Invoke-AzureGet -Uri $uri
 }
+
+# ------------------------------------------------------------
+# Updated preview function with HTTP response diagnostics
+# ------------------------------------------------------------
 
 function Get-PipelinePreview {
     param(
@@ -265,26 +273,69 @@ function Get-PipelinePreview {
         [Parameter(Mandatory)][string]$PipelineId
     )
 
-    $encodedProjectId = ConvertTo-EncodedSegment -Value $ProjectId
-    $uri = "$AzureBaseUrl/$encodedProjectId/_apis/pipelines/$PipelineId/preview" +
-           "?api-version=7.1"
+    $encodedProjectId = [Uri]::EscapeDataString($ProjectId)
+    $uri = "$AzureBaseUrl/$encodedProjectId/_apis/pipelines/$PipelineId/preview?api-version=7.1"
 
     $body = @{
         previewRun = $true
-    } | ConvertTo-Json -Depth 20
+    } | ConvertTo-Json -Compress
 
     if ($RequestDelayMilliseconds -gt 0) {
         Start-Sleep -Milliseconds $RequestDelayMilliseconds
     }
 
-    return Invoke-RestMethod `
-        -Method Post `
-        -Uri $uri `
-        -Headers $AzureHeaders `
-        -ContentType "application/json" `
-        -Body $body `
-        -ErrorAction Stop
+    try {
+        return Invoke-RestMethod `
+            -Method Post `
+            -Uri $uri `
+            -Headers $AzureHeaders `
+            -ContentType "application/json; charset=utf-8" `
+            -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) `
+            -ErrorAction Stop
+    }
+    catch {
+        $statusCode = $null
+        $responseBody = $null
+
+        try {
+            if ($null -ne $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+        }
+        catch {
+            $statusCode = "Unknown"
+        }
+
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $responseBody = $_.ErrorDetails.Message
+        }
+        else {
+            try {
+                $response = $_.Exception.Response
+                $stream = $response.GetResponseStream()
+
+                if ($null -ne $stream) {
+                    $reader = [System.IO.StreamReader]::new($stream)
+                    $responseBody = $reader.ReadToEnd()
+                    $reader.Dispose()
+                }
+            }
+            catch {
+                $responseBody = "The response body could not be read."
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($responseBody)) {
+            $responseBody = $_.Exception.Message
+        }
+
+        throw "Pipeline preview failed. ProjectId='$ProjectId'; PipelineId='$PipelineId'; HTTP=$statusCode; Details=$responseBody"
+    }
 }
+
+# ------------------------------------------------------------
+# YAML matching helpers
+# ------------------------------------------------------------
 
 function Test-ProjectKeyInYaml {
     param(
@@ -296,7 +347,6 @@ function Test-ProjectKeyInYaml {
         return $false
     }
 
-    # Match the key as a token, not as part of a longer identifier.
     $escapedKey = [regex]::Escape($ProjectKey)
     $pattern = "(?<![A-Za-z0-9_.-])$escapedKey(?![A-Za-z0-9_.-])"
 
@@ -342,21 +392,16 @@ function Get-RepositoryMetadata {
     $configuration = Get-ObjectProperty -Object $PipelineDetails -Name "configuration"
     $repository = Get-ObjectProperty -Object $configuration -Name "repository"
 
-    $repositoryId = [string](Get-ObjectProperty -Object $repository -Name "id")
-    $repositoryName = [string](Get-ObjectProperty -Object $repository -Name "name")
-    $yamlPath = [string](Get-ObjectProperty -Object $configuration -Name "path")
-    $configurationType = [string](Get-ObjectProperty -Object $configuration -Name "type")
-
     return [PSCustomObject]@{
-        RepositoryId   = $repositoryId
-        RepositoryName = $repositoryName
-        YamlPath       = $yamlPath
-        ConfigurationType = $configurationType
+        RepositoryId = [string](Get-ObjectProperty -Object $repository -Name "id")
+        RepositoryName = [string](Get-ObjectProperty -Object $repository -Name "name")
+        YamlPath = [string](Get-ObjectProperty -Object $configuration -Name "path")
+        ConfigurationType = [string](Get-ObjectProperty -Object $configuration -Name "type")
     }
 }
 
 # ------------------------------------------------------------
-# Import SonarQube project list
+# Load SonarQube projects
 # ------------------------------------------------------------
 
 Write-Host ""
@@ -386,13 +431,14 @@ $AzureProjects = @(Get-AzureProjects)
 Write-Host "Azure DevOps projects found: $($AzureProjects.Count)"
 
 # ------------------------------------------------------------
-# Inventory YAML pipelines and retrieve expanded YAML previews
+# Inventory pipelines and request expanded YAML previews
 # ------------------------------------------------------------
 
 $PipelineInventory = [System.Collections.Generic.List[object]]::new()
 $PipelineCounter = 0
 $PreviewErrorCount = 0
 $NonYamlCount = 0
+$ProjectScanCounter = 0
 
 foreach ($azureProject in $AzureProjects) {
     $azureProjectId = [string](Get-ObjectProperty -Object $azureProject -Name "id")
@@ -402,6 +448,7 @@ foreach ($azureProject in $AzureProjects) {
         continue
     }
 
+    $ProjectScanCounter++
     Write-Host ""
     Write-Host "Scanning Azure DevOps project: $azureProjectName"
 
@@ -423,11 +470,6 @@ foreach ($azureProject in $AzureProjects) {
 
         $PipelineCounter++
 
-        Write-Progress `
-            -Activity "Retrieving Azure DevOps pipeline previews" `
-            -Status "$azureProjectName / $pipelineName" `
-            -PercentComplete ([Math]::Min(100, ($PipelineCounter / [Math]::Max(1, $pipelines.Count)) * 100))
-
         $details = $null
 
         try {
@@ -441,8 +483,7 @@ foreach ($azureProject in $AzureProjects) {
 
         $metadata = Get-RepositoryMetadata -PipelineDetails $details
 
-        # Fall back to the pipeline list object if details are incomplete.
-        if ([string]::IsNullOrWhiteSpace($metadata.ConfigurationType)) {
+        if ($metadata.ConfigurationType -ne "yaml") {
             $metadata = Get-RepositoryMetadata -PipelineDetails $pipeline
         }
 
@@ -466,6 +507,8 @@ foreach ($azureProject in $AzureProjects) {
                 $previewStatus = "EmptyPreview"
                 $previewError = "The preview response did not contain finalYaml."
                 $PreviewErrorCount++
+
+                Write-Warning "Preview returned no finalYaml for '$azureProjectName / $pipelineName'."
             }
         }
         catch {
@@ -473,26 +516,24 @@ foreach ($azureProject in $AzureProjects) {
             $previewError = $_.Exception.Message
             $PreviewErrorCount++
 
-            Write-Warning "Preview failed for '$azureProjectName / $pipelineName': $previewError"
+            Write-Warning $previewError
         }
 
         $PipelineInventory.Add([PSCustomObject]@{
             AzureProjectName = $azureProjectName
-            AzureProjectId   = $azureProjectId
-            PipelineName     = $pipelineName
-            PipelineId       = $pipelineId
-            RepositoryName   = $metadata.RepositoryName
-            RepositoryId     = $metadata.RepositoryId
-            YamlPath         = $metadata.YamlPath
+            AzureProjectId = $azureProjectId
+            PipelineName = $pipelineName
+            PipelineId = $pipelineId
+            RepositoryName = $metadata.RepositoryName
+            RepositoryId = $metadata.RepositoryId
+            YamlPath = $metadata.YamlPath
             ConfigurationType = $metadata.ConfigurationType
-            PreviewStatus    = $previewStatus
-            PreviewError     = $previewError
-            FinalYaml        = $previewYaml
+            PreviewStatus = $previewStatus
+            PreviewError = $previewError
+            FinalYaml = $previewYaml
         })
     }
 }
-
-Write-Progress -Activity "Retrieving Azure DevOps pipeline previews" -Completed
 
 Write-Host ""
 Write-Host "Pipeline inventory completed."
@@ -501,7 +542,7 @@ Write-Host "Non-YAML pipelines skipped: $NonYamlCount"
 Write-Host "Preview errors or empty previews: $PreviewErrorCount"
 
 # ------------------------------------------------------------
-# Match SonarQube project keys against expanded YAML
+# Match SonarQube projects against expanded YAML
 # ------------------------------------------------------------
 
 $Results = [System.Collections.Generic.List[object]]::new()
@@ -522,22 +563,22 @@ foreach ($sonarProject in $SonarProjects) {
 
     if ($binding.State -eq "Bound") {
         $Results.Add([PSCustomObject]@{
-            ProjectName       = $projectName
-            ProjectKey        = $projectKey
-            BindingState      = "AlreadyBound"
-            MatchStatus       = "SkippedAlreadyBound"
-            CandidateCount    = 0
-            AzureProjectName  = ""
-            AzureProjectId    = ""
-            RepositoryName    = ""
-            RepositoryId      = ""
-            PipelineName      = ""
-            PipelineId        = ""
-            YamlPath           = ""
-            Evidence          = ""
-            PreviewError      = ""
-            Approved          = "NO"
-            Notes             = "An existing SonarQube binding was found. No changes were made."
+            ProjectName = $projectName
+            ProjectKey = $projectKey
+            BindingState = "AlreadyBound"
+            MatchStatus = "SkippedAlreadyBound"
+            CandidateCount = 0
+            AzureProjectName = ""
+            AzureProjectId = ""
+            RepositoryName = ""
+            RepositoryId = ""
+            PipelineName = ""
+            PipelineId = ""
+            YamlPath = ""
+            Evidence = ""
+            PreviewError = ""
+            Approved = "NO"
+            Notes = "An existing SonarQube binding was found. No changes were made."
         })
 
         continue
@@ -545,22 +586,22 @@ foreach ($sonarProject in $SonarProjects) {
 
     if ($binding.State -eq "CheckError") {
         $Results.Add([PSCustomObject]@{
-            ProjectName       = $projectName
-            ProjectKey        = $projectKey
-            BindingState      = "CheckError"
-            MatchStatus       = "BindingCheckError"
-            CandidateCount    = 0
-            AzureProjectName  = ""
-            AzureProjectId    = ""
-            RepositoryName    = ""
-            RepositoryId      = ""
-            PipelineName      = ""
-            PipelineId        = ""
-            YamlPath           = ""
-            Evidence          = ""
-            PreviewError      = $binding.Error
-            Approved          = "NO"
-            Notes             = "The existing binding could not be verified. Review this project manually."
+            ProjectName = $projectName
+            ProjectKey = $projectKey
+            BindingState = "CheckError"
+            MatchStatus = "BindingCheckError"
+            CandidateCount = 0
+            AzureProjectName = ""
+            AzureProjectId = ""
+            RepositoryName = ""
+            RepositoryId = ""
+            PipelineName = ""
+            PipelineId = ""
+            YamlPath = ""
+            Evidence = ""
+            PreviewError = $binding.Error
+            Approved = "NO"
+            Notes = "The existing binding could not be verified. Review this project manually."
         })
 
         continue
@@ -581,23 +622,23 @@ foreach ($sonarProject in $SonarProjects) {
         }
 
         if (Test-ProjectKeyInYaml -Yaml $inventoryItem.FinalYaml -ProjectKey $projectKey) {
-            $evidence = Get-YamlEvidence -Yaml $inventoryItem.FinalYaml -ProjectKey $projectKey
+            $evidence = Get-YamlEvidence `
+                -Yaml $inventoryItem.FinalYaml `
+                -ProjectKey $projectKey
 
             $matches.Add([PSCustomObject]@{
                 AzureProjectName = $inventoryItem.AzureProjectName
-                AzureProjectId   = $inventoryItem.AzureProjectId
-                RepositoryName   = $inventoryItem.RepositoryName
-                RepositoryId     = $inventoryItem.RepositoryId
-                PipelineName     = $inventoryItem.PipelineName
-                PipelineId       = $inventoryItem.PipelineId
-                YamlPath         = $inventoryItem.YamlPath
-                Evidence         = $evidence
+                AzureProjectId = $inventoryItem.AzureProjectId
+                RepositoryName = $inventoryItem.RepositoryName
+                RepositoryId = $inventoryItem.RepositoryId
+                PipelineName = $inventoryItem.PipelineName
+                PipelineId = $inventoryItem.PipelineId
+                YamlPath = $inventoryItem.YamlPath
+                Evidence = $evidence
             })
         }
     }
 
-    # Group matches by repository identity so multiple pipelines in the same
-    # repository count as one candidate rather than several candidates.
     $repositoryGroups = @(
         $matches | Group-Object -Property {
             if (-not [string]::IsNullOrWhiteSpace($_.RepositoryId)) {
@@ -622,22 +663,22 @@ foreach ($sonarProject in $SonarProjects) {
         }
 
         $Results.Add([PSCustomObject]@{
-            ProjectName       = $projectName
-            ProjectKey        = $projectKey
-            BindingState      = "NotBound"
-            MatchStatus       = $status
-            CandidateCount    = 0
-            AzureProjectName  = ""
-            AzureProjectId    = ""
-            RepositoryName    = ""
-            RepositoryId      = ""
-            PipelineName      = ""
-            PipelineId        = ""
-            YamlPath           = ""
-            Evidence          = ""
-            PreviewError      = $errorText
-            Approved          = "NO"
-            Notes             = $notes
+            ProjectName = $projectName
+            ProjectKey = $projectKey
+            BindingState = "NotBound"
+            MatchStatus = $status
+            CandidateCount = 0
+            AzureProjectName = ""
+            AzureProjectId = ""
+            RepositoryName = ""
+            RepositoryId = ""
+            PipelineName = ""
+            PipelineId = ""
+            YamlPath = ""
+            Evidence = ""
+            PreviewError = $errorText
+            Approved = "NO"
+            Notes = $notes
         })
 
         continue
@@ -667,28 +708,41 @@ foreach ($sonarProject in $SonarProjects) {
             $notes = "Multiple distinct Azure DevOps repositories matched the project key. Manual investigation is required."
         }
 
-        $pipelineNames = @($groupMatches | ForEach-Object { $_.PipelineName } | Select-Object -Unique)
-        $pipelineIds = @($groupMatches | ForEach-Object { $_.PipelineId } | Select-Object -Unique)
-        $yamlPaths = @($groupMatches | ForEach-Object { $_.YamlPath } | Where-Object { $_ } | Select-Object -Unique)
-        $evidenceLines = @($groupMatches | ForEach-Object { $_.Evidence } | Where-Object { $_ } | Select-Object -Unique)
+        $pipelineNames = @(
+            $groupMatches | ForEach-Object { $_.PipelineName } | Select-Object -Unique
+        )
+
+        $pipelineIds = @(
+            $groupMatches | ForEach-Object { $_.PipelineId } | Select-Object -Unique
+        )
+
+        $yamlPaths = @(
+            $groupMatches | ForEach-Object { $_.YamlPath } |
+                Where-Object { $_ } | Select-Object -Unique
+        )
+
+        $evidenceLines = @(
+            $groupMatches | ForEach-Object { $_.Evidence } |
+                Where-Object { $_ } | Select-Object -Unique
+        )
 
         $Results.Add([PSCustomObject]@{
-            ProjectName       = $projectName
-            ProjectKey        = $projectKey
-            BindingState      = "NotBound"
-            MatchStatus       = $matchStatus
-            CandidateCount    = $candidateCount
-            AzureProjectName  = $firstMatch.AzureProjectName
-            AzureProjectId    = $firstMatch.AzureProjectId
-            RepositoryName    = $firstMatch.RepositoryName
-            RepositoryId      = $firstMatch.RepositoryId
-            PipelineName      = ($pipelineNames -join " | ")
-            PipelineId        = ($pipelineIds -join " | ")
-            YamlPath           = ($yamlPaths -join " | ")
-            Evidence          = ($evidenceLines -join " | ")
-            PreviewError      = ""
-            Approved          = "NO"
-            Notes             = $notes
+            ProjectName = $projectName
+            ProjectKey = $projectKey
+            BindingState = "NotBound"
+            MatchStatus = $matchStatus
+            CandidateCount = $candidateCount
+            AzureProjectName = $firstMatch.AzureProjectName
+            AzureProjectId = $firstMatch.AzureProjectId
+            RepositoryName = $firstMatch.RepositoryName
+            RepositoryId = $firstMatch.RepositoryId
+            PipelineName = ($pipelineNames -join " | ")
+            PipelineId = ($pipelineIds -join " | ")
+            YamlPath = ($yamlPaths -join " | ")
+            Evidence = ($evidenceLines -join " | ")
+            PreviewError = ""
+            Approved = "NO"
+            Notes = $notes
         })
     }
 }
@@ -710,7 +764,7 @@ Write-Host "============================================================"
 Write-Host "Discovery completed"
 Write-Host "============================================================"
 Write-Host "SonarQube projects processed: $($SonarProjects.Count)"
-Write-Host "Pipeline previews attempted: $($PipelineInventory.Count)"
+Write-Host "Pipeline previews inventoried: $($PipelineInventory.Count)"
 Write-Host "Preview errors or empty previews: $PreviewErrorCount"
 Write-Host "Results exported to: $OutputCsv"
 Write-Host ""
