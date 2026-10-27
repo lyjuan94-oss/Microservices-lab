@@ -4,36 +4,30 @@ param(
     [string]$InputCsv,
 
     [string]$OutputCsv = ".\Sonar_Azure_Binding_Discovery.csv",
-    [string]$SonarUrl = "https://aas-sonar-pr.azure-paas.com",
-    [string]$AzureOrganization = "AASolutions",
-    [string]$AlmSetting = "Azure DevOps",
 
-    [string]$YamlPathPattern = '\.ya?ml$'
+    [string]$SonarUrl = "https://aas-sonar-pr.azure-paas.com",
+
+    [string]$AzureOrganization = "AASolutions"
 )
 
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
-# 1. VALIDAR CREDENCIALES
+# 1. CONFIGURATION AND AUTHENTICATION
 # ============================================================
 
 if ([string]::IsNullOrWhiteSpace($env:SONARQUBE_TOKEN)) {
-    throw 'Define SONARQUBE_TOKEN como variable de entorno.'
+    throw "Environment variable SONARQUBE_TOKEN is not defined."
 }
 
-$AzdoToken = if (-not [string]::IsNullOrWhiteSpace($env:AZDO_PAT)) {
-    $env:AZDO_PAT
+if (-not [string]::IsNullOrWhiteSpace($env:AZDO_PAT)) {
+    $AzdoToken = $env:AZDO_PAT
 }
 elseif (-not [string]::IsNullOrWhiteSpace($env:SYSTEM_ACCESSTOKEN)) {
-    $env:SYSTEM_ACCESSTOKEN
+    $AzdoToken = $env:SYSTEM_ACCESSTOKEN
 }
 else {
-    $null
-}
-
-if ([string]::IsNullOrWhiteSpace($AzdoToken)) {
-    throw 'Define AZDO_PAT o SYSTEM_ACCESSTOKEN como variable de entorno.'
+    throw "Define AZDO_PAT or SYSTEM_ACCESSTOKEN."
 }
 
 $SonarUrl = $SonarUrl.TrimEnd('/')
@@ -56,8 +50,31 @@ $AzdoHeaders = @{
 }
 
 # ============================================================
-# 2. FUNCIONES HTTP
+# 2. SAFE OBJECT PROPERTY ACCESS
+# Prevents failures when API objects omit optional properties.
 # ============================================================
+
+function Get-PropertyValue {
+    param(
+        [AllowNull()]
+        [object]$Object,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PropertyName
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+
+    $property = $Object.PSObject.Properties[$PropertyName]
+
+    if ($null -ne $property) {
+        return $property.Value
+    }
+
+    return $null
+}
 
 function Invoke-JsonGet {
     param(
@@ -77,7 +94,7 @@ function Invoke-JsonGet {
 }
 
 function Get-HttpStatusCode {
-    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    param($ErrorRecord)
 
     try {
         if ($null -ne $ErrorRecord.Exception.Response) {
@@ -90,134 +107,103 @@ function Get-HttpStatusCode {
 }
 
 # ============================================================
-# 3. IMPORTAR Y NORMALIZAR EL CSV
+# 3. READ AND VALIDATE THE INPUT CSV
+# Supports comma, semicolon, and UTF-8 BOM.
 # ============================================================
 
 if (-not (Test-Path -LiteralPath $InputCsv -PathType Leaf)) {
-    throw "No existe el CSV de entrada: $InputCsv"
+    throw "Input CSV file does not exist: $InputCsv"
 }
 
-$resolvedInput = (Resolve-Path -LiteralPath $InputCsv).Path
+$InputCsv = (Resolve-Path -LiteralPath $InputCsv).Path
 
-Write-Host "CSV de entrada: $resolvedInput"
+Write-Host ""
+Write-Host "Input CSV: $InputCsv"
 
-# Leer la primera línea para detectar delimitador.
-$firstLine = Get-Content `
-    -LiteralPath $resolvedInput `
-    -TotalCount 1 `
-    -Encoding UTF8
+$csvRows = $null
+$detectedDelimiter = $null
 
-if ([string]::IsNullOrWhiteSpace($firstLine)) {
-    throw 'El CSV está vacío o no contiene encabezados.'
-}
+foreach ($candidateDelimiter in @(',', ';', "`t")) {
+    try {
+        $candidateRows = @(
+            Import-Csv `
+                -LiteralPath $InputCsv `
+                -Delimiter $candidateDelimiter `
+                -Encoding UTF8 `
+                -ErrorAction Stop
+        )
 
-$commaCount = ([regex]::Matches($firstLine, ',')).Count
-$semicolonCount = ([regex]::Matches($firstLine, ';')).Count
-$tabCount = ([regex]::Matches($firstLine, "`t")).Count
+        if ($candidateRows.Count -eq 0) {
+            continue
+        }
 
-if ($semicolonCount -gt $commaCount -and $semicolonCount -ge $tabCount) {
-    $delimiter = ';'
-}
-elseif ($tabCount -gt $commaCount -and $tabCount -gt $semicolonCount) {
-    $delimiter = "`t"
-}
-else {
-    $delimiter = ','
-}
+        $headers = @(
+            $candidateRows[0].PSObject.Properties |
+                ForEach-Object {
+                    ([string]$_.Name).Trim().TrimStart([char]0xFEFF)
+                }
+        )
 
-Write-Host "Delimitador detectado: $(
-    switch ($delimiter) {
-        ','  { 'coma' }
-        ';'  { 'punto y coma' }
-        "`t" { 'tabulador' }
-    }
-)"
+        $hasName = @(
+            $headers | Where-Object { $_ -ieq 'ProjectName' }
+        ).Count -gt 0
 
-# Importar filas.
-$sonarRows = @(
-    Import-Csv `
-        -LiteralPath $resolvedInput `
-        -Delimiter $delimiter `
-        -Encoding UTF8
-)
+        $hasKey = @(
+            $headers | Where-Object { $_ -ieq 'ProjectKey' }
+        ).Count -gt 0
 
-if ($sonarRows.Count -eq 0) {
-    throw 'El CSV no contiene registros.'
-}
-
-# Normalizar encabezados: BOM, espacios y nombres.
-$normalizedRows = [System.Collections.Generic.List[object]]::new()
-
-foreach ($row in $sonarRows) {
-    $normalized = [ordered]@{}
-
-    foreach ($property in $row.PSObject.Properties) {
-        $columnName = [string]$property.Name
-        $columnName = $columnName.Trim()
-        $columnName = $columnName.TrimStart([char]0xFEFF)
-
-        if (-not $normalized.Contains($columnName)) {
-            $normalized[$columnName] = $property.Value
+        if ($hasName -and $hasKey) {
+            $csvRows = $candidateRows
+            $detectedDelimiter = $candidateDelimiter
+            break
         }
     }
-
-    $normalizedRows.Add([pscustomobject]$normalized)
+    catch {
+        # Try the next delimiter.
+    }
 }
 
-$sonarRows = @($normalizedRows)
-
-$columns = @($sonarRows[0].PSObject.Properties.Name)
-
-Write-Host "Columnas detectadas: $($columns -join ', ')"
-
-# Comprobar encabezados obligatorios sin distinguir mayúsculas.
-$projectNameColumn = @(
-    $columns | Where-Object {
-        $_.Trim() -ieq 'ProjectName'
-    }
-) | Select-Object -First 1
-
-$projectKeyColumn = @(
-    $columns | Where-Object {
-        $_.Trim() -ieq 'ProjectKey'
-    }
-) | Select-Object -First 1
-
-if (-not $projectNameColumn -or -not $projectKeyColumn) {
-    Write-Host ''
-    Write-Host 'Encabezados encontrados:'
-    $columns | ForEach-Object { Write-Host "  [$($_)]" }
-
-    throw (
-        "El CSV debe incluir las columnas ProjectName y ProjectKey. " +
-        "Revisa el delimitador y los encabezados del archivo."
-    )
+if ($null -eq $csvRows) {
+    throw "Could not find ProjectName and ProjectKey columns in the input CSV."
 }
 
-# Normalizar nombres a los esperados por el resto del script.
 $sonarRows = @(
-    foreach ($row in $sonarRows) {
-        [pscustomobject]@{
-            ProjectName = ([string]$row.$projectNameColumn).Trim()
-            ProjectKey  = ([string]$row.$projectKeyColumn).Trim()
+    foreach ($row in $csvRows) {
+        $projectName = ''
+        $projectKey = ''
+
+        foreach ($property in $row.PSObject.Properties) {
+            $columnName = ([string]$property.Name).
+                Trim().
+                TrimStart([char]0xFEFF)
+
+            if ($columnName -ieq 'ProjectName') {
+                $projectName = ([string]$property.Value).Trim()
+            }
+
+            if ($columnName -ieq 'ProjectKey') {
+                $projectKey = ([string]$property.Value).Trim()
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($projectKey)) {
+            [pscustomobject]@{
+                ProjectName = $projectName
+                ProjectKey  = $projectKey
+            }
         }
     }
 )
 
-$sonarRows = @(
-    $sonarRows | Where-Object {
-        -not [string]::IsNullOrWhiteSpace($_.ProjectKey)
-    }
-)
-
 if ($sonarRows.Count -eq 0) {
-    throw 'No se encontraron filas con ProjectKey.'
+    throw "No valid project keys were found in the CSV."
 }
 
-Write-Host "Proyectos SonarQube en el CSV: $($sonarRows.Count)"
+Write-Host "CSV columns validated: ProjectName, ProjectKey"
+Write-Host "SonarQube projects loaded: $($sonarRows.Count)"
 
 # ============================================================
-# 4. COMPROBAR BINDINGS EXISTENTES
+# 4. CHECK SONARQUBE BINDING STATUS
 # ============================================================
 
 function Test-SonarBinding {
@@ -227,6 +213,7 @@ function Test-SonarBinding {
     )
 
     $encodedKey = [Uri]::EscapeDataString($ProjectKey)
+
     $uri = "$SonarUrl/api/alm_settings/get_binding?project=$encodedKey"
 
     try {
@@ -234,7 +221,7 @@ function Test-SonarBinding {
         return 'AlreadyBound'
     }
     catch {
-        $status = Get-HttpStatusCode -ErrorRecord $_
+        $status = Get-HttpStatusCode $_
 
         if ($status -eq 404) {
             return 'Unbound'
@@ -245,7 +232,7 @@ function Test-SonarBinding {
 }
 
 # ============================================================
-# 5. INVENTARIO DE PROYECTOS AZURE DEVOPS
+# 5. AZURE DEVOPS API FUNCTIONS
 # ============================================================
 
 function Get-AzdoProjects {
@@ -253,7 +240,7 @@ function Get-AzdoProjects {
 
     $response = Invoke-JsonGet -Url $uri -Headers $AzdoHeaders
 
-    return @($response.value)
+    return @(Get-PropertyValue -Object $response -PropertyName 'value')
 }
 
 function Get-AzdoPipelines {
@@ -268,7 +255,7 @@ function Get-AzdoPipelines {
 
     $response = Invoke-JsonGet -Url $uri -Headers $AzdoHeaders
 
-    return @($response.value)
+    return @(Get-PropertyValue -Object $response -PropertyName 'value')
 }
 
 function Get-PipelineDetails {
@@ -284,7 +271,7 @@ function Get-PipelineDetails {
 
     $uri = "$AzureBase/$encodedProjectId/_apis/pipelines/$PipelineId`?api-version=7.1"
 
-    Invoke-JsonGet -Url $uri -Headers $AzdoHeaders
+    return Invoke-JsonGet -Url $uri -Headers $AzdoHeaders
 }
 
 function Get-YamlContent {
@@ -303,103 +290,159 @@ function Get-YamlContent {
     $encodedRepositoryId = [Uri]::EscapeDataString($RepositoryId)
     $encodedPath = [Uri]::EscapeDataString($Path)
 
-    $uri = (
-        "$AzureBase/$encodedProjectId/_apis/git/repositories/" +
-        "$encodedRepositoryId/items?path=$encodedPath" +
-        "&includeContent=true&api-version=7.1"
-    )
+    $uri = "$AzureBase/$encodedProjectId/_apis/git/repositories/$encodedRepositoryId/items?path=$encodedPath&includeContent=true&api-version=7.1"
 
     $response = Invoke-JsonGet -Url $uri -Headers $AzdoHeaders
 
-    if ($response.PSObject.Properties.Name -contains 'content') {
-        return [string]$response.content
+    # Some API responses may be returned as plain text.
+    if ($response -is [string]) {
+        return $response
+    }
+
+    $content = Get-PropertyValue -Object $response -PropertyName 'content'
+
+    if ($null -ne $content) {
+        return [string]$content
     }
 
     return $null
 }
 
-Write-Host ''
-Write-Host 'Obteniendo proyectos de Azure DevOps...'
+# ============================================================
+# 6. DISCOVER AZURE DEVOPS PROJECTS
+# ============================================================
+
+Write-Host ""
+Write-Host "Retrieving Azure DevOps projects..."
 
 $azProjects = @(Get-AzdoProjects)
 
 if ($azProjects.Count -eq 0) {
-    throw 'No se encontraron proyectos de Azure DevOps. Verifica los permisos del PAT.'
+    throw "Azure DevOps returned no projects. Check the PAT permissions."
 }
 
-Write-Host "Proyectos Azure DevOps encontrados: $($azProjects.Count)"
+Write-Host "Azure DevOps projects found: $($azProjects.Count)"
 
 # ============================================================
-# 6. LEER PIPELINES YAML Y SUS ARCHIVOS
+# 7. INVENTORY YAML PIPELINES
+# Classic pipelines are intentionally excluded.
 # ============================================================
 
 $pipelineInventory = [System.Collections.Generic.List[object]]::new()
 
+$projectIndex = 0
+
 foreach ($azProject in $azProjects) {
-    Write-Host "Proyecto Azure DevOps: $($azProject.name)"
+    $projectIndex++
+
+    $azProjectId = [string](
+        Get-PropertyValue $azProject 'id'
+    )
+
+    $azProjectName = [string](
+        Get-PropertyValue $azProject 'name'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($azProjectId)) {
+        Write-Warning "Skipping an Azure DevOps project with no ID."
+        continue
+    }
+
+    if ([string]::IsNullOrWhiteSpace($azProjectName)) {
+        $azProjectName = $azProjectId
+    }
+
+    Write-Host "[$projectIndex/$($azProjects.Count)] Project: $azProjectName"
 
     try {
-        $pipelines = @(
-            Get-AzdoPipelines -ProjectId ([string]$azProject.id)
-        )
+        $pipelines = @(Get-AzdoPipelines -ProjectId $azProjectId)
     }
     catch {
-        Write-Warning (
-            "No se pudieron listar pipelines en '$($azProject.name)': " +
-            $_.Exception.Message
-        )
+        Write-Warning "Could not list pipelines for '$azProjectName': $($_.Exception.Message)"
         continue
     }
 
     foreach ($pipeline in $pipelines) {
+        $pipelineIdValue = Get-PropertyValue $pipeline 'id'
+        $pipelineName = [string](
+            Get-PropertyValue $pipeline 'name'
+        )
+
+        if ($null -eq $pipelineIdValue) {
+            Write-Warning "Skipping a pipeline without an ID in '$azProjectName'."
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($pipelineName)) {
+            $pipelineName = "Pipeline-$pipelineIdValue"
+        }
+
         try {
             $details = Get-PipelineDetails `
-                -ProjectId ([string]$azProject.id) `
-                -PipelineId ([int]$pipeline.id)
+                -ProjectId $azProjectId `
+                -PipelineId ([int]$pipelineIdValue
+            )
         }
         catch {
-            Write-Warning (
-                "No se pudieron leer detalles de la pipeline " +
-                "'$($pipeline.name)' en '$($azProject.name)': " +
-                $_.Exception.Message
-            )
+            Write-Warning "Could not read pipeline '$pipelineName': $($_.Exception.Message)"
             continue
         }
 
-        $configuration = $details.configuration
+        $configuration = Get-PropertyValue $details 'configuration'
 
-        # Solo YAML; ignorar pipelines clásicas.
-        if ([string]$configuration.type -ne 'yaml') {
+        if ($null -eq $configuration) {
             continue
         }
 
-        $yamlPath = [string]$configuration.path
-        $repository = $configuration.repository
+        $configurationType = [string](
+            Get-PropertyValue $configuration 'type'
+        )
+
+        # Only YAML pipelines are included.
+        if ($configurationType -ine 'yaml') {
+            continue
+        }
+
+        $yamlPath = [string](
+            Get-PropertyValue $configuration 'path'
+        )
+
+        $repository = Get-PropertyValue $configuration 'repository'
 
         if ([string]::IsNullOrWhiteSpace($yamlPath)) {
+            Write-Warning "Pipeline '$pipelineName' has no YAML path."
             continue
         }
 
-        if ($yamlPath -notmatch $YamlPathPattern) {
+        if ($yamlPath -notmatch '\.ya?ml$') {
+            Write-Warning "Skipping non-YAML path '$yamlPath' in '$pipelineName'."
             continue
         }
 
-        if ($null -eq $repository -or
-            [string]::IsNullOrWhiteSpace([string]$repository.id)) {
-            Write-Warning (
-                "Pipeline '$($pipeline.name)' no expone un repositorio " +
-                'identificable. Se excluye de la búsqueda.'
-            )
+        $repositoryId = [string](
+            Get-PropertyValue $repository 'id'
+        )
+
+        $repositoryName = [string](
+            Get-PropertyValue $repository 'name'
+        )
+
+        $repositoryType = [string](
+            Get-PropertyValue $repository 'type'
+        )
+
+        if ([string]::IsNullOrWhiteSpace($repositoryId)) {
+            Write-Warning "Repository ID is missing for '$pipelineName'."
             continue
         }
 
-        $repositoryId = [string]$repository.id
-        $repositoryName = [string]$repository.name
-        $repositoryType = [string]$repository.type
+        if ([string]::IsNullOrWhiteSpace($repositoryName)) {
+            $repositoryName = $repositoryId
+        }
 
         try {
             $yamlContent = Get-YamlContent `
-                -ProjectId ([string]$azProject.id) `
+                -ProjectId $azProjectId `
                 -RepositoryId $repositoryId `
                 -Path $yamlPath
 
@@ -414,18 +457,15 @@ foreach ($azProject in $azProjects) {
             $yamlContent = $null
             $readStatus = "YamlReadError: $($_.Exception.Message)"
 
-            Write-Warning (
-                "No se pudo leer '$yamlPath' del repositorio " +
-                "'$repositoryName': $($_.Exception.Message)"
-            )
+            Write-Warning "Could not read '$yamlPath' from '$repositoryName'."
         }
 
         $pipelineInventory.Add(
             [pscustomobject]@{
-                AzureProjectName = [string]$azProject.name
-                AzureProjectId   = [string]$azProject.id
-                PipelineName     = [string]$pipeline.name
-                PipelineId       = [int]$pipeline.id
+                AzureProjectName = $azProjectName
+                AzureProjectId   = $azProjectId
+                PipelineName     = $pipelineName
+                PipelineId       = [int]$pipelineIdValue
                 RepositoryName   = $repositoryName
                 RepositoryId     = $repositoryId
                 RepositoryType   = $repositoryType
@@ -437,20 +477,25 @@ foreach ($azProject in $azProjects) {
     }
 }
 
-Write-Host ''
-Write-Host "Pipelines YAML inventariadas: $($pipelineInventory.Count)"
+Write-Host ""
+Write-Host "YAML pipeline inventory completed."
+Write-Host "YAML pipelines inspected: $($pipelineInventory.Count)"
 
 # ============================================================
-# 7. BUSCAR CADA CLAVE SONAR EN LOS YAML
+# 8. MATCH SONARQUBE PROJECT KEYS AGAINST YAML CONTENT
 # ============================================================
 
 $results = [System.Collections.Generic.List[object]]::new()
 
+$sonarIndex = 0
+
 foreach ($sonarProject in $sonarRows) {
+    $sonarIndex++
+
     $key = [string]$sonarProject.ProjectKey
     $name = [string]$sonarProject.ProjectName
 
-    Write-Host "Buscando clave SonarQube: $key"
+    Write-Host "[$sonarIndex/$($sonarRows.Count)] Searching key: $key"
 
     $bindingState = Test-SonarBinding -ProjectKey $key
 
@@ -471,7 +516,7 @@ foreach ($sonarProject in $sonarRows) {
                 YamlPath         = ''
                 Evidence         = ''
                 Approved         = 'NO'
-                Notes            = 'Ya tiene binding; no se propone modificarlo.'
+                Notes            = 'The project already has a binding.'
             }
         )
 
@@ -495,7 +540,7 @@ foreach ($sonarProject in $sonarRows) {
                 YamlPath         = ''
                 Evidence         = ''
                 Approved         = 'NO'
-                Notes            = 'No se pudo confirmar que el proyecto esté sin binding.'
+                Notes            = 'Could not confirm the current binding state.'
             }
         )
 
@@ -505,18 +550,22 @@ foreach ($sonarProject in $sonarRows) {
     $escapedKey = [Regex]::Escape($key)
 
     $keyMatches = @(
-        $pipelineInventory | Where-Object {
-            $content = [string]$_.YamlContent
+        foreach ($item in $pipelineInventory) {
+            $content = [string]$item.YamlContent
 
             if ([string]::IsNullOrWhiteSpace($content)) {
-                return $false
+                continue
             }
 
-            [Regex]::IsMatch(
+            $found = [Regex]::IsMatch(
                 $content,
                 "(?<![A-Za-z0-9_.-])$escapedKey(?![A-Za-z0-9_.-])",
                 [Text.RegularExpressions.RegexOptions]::IgnoreCase
             )
+
+            if ($found) {
+                $item
+            }
         }
     )
 
@@ -535,16 +584,16 @@ foreach ($sonarProject in $sonarRows) {
                 PipelineName     = ''
                 PipelineId       = ''
                 YamlPath         = ''
-                Evidence         = 'No se encontró la clave exacta en los YAML leídos.'
+                Evidence         = 'The exact key was not found in readable YAML files.'
                 Approved         = 'NO'
-                Notes            = 'Puede aparecer en templates, variables dinámicas o pipelines excluidas.'
+                Notes            = 'The key may be in a shared template, a variable, or an excluded pipeline.'
             }
         )
 
         continue
     }
 
-    # Contar repositorios distintos, no pipelines.
+    # Count distinct project/repository combinations.
     $repositoryGroups = @(
         $keyMatches |
             Group-Object {
@@ -552,20 +601,19 @@ foreach ($sonarProject in $sonarRows) {
             }
     )
 
-    $matchStatus = if ($repositoryGroups.Count -eq 1) {
-        'UniqueRepositoryMatch'
+    if ($repositoryGroups.Count -eq 1) {
+        $matchStatus = 'UniqueRepositoryMatch'
     }
     else {
-        'AmbiguousRepositoryMatch'
+        $matchStatus = 'AmbiguousRepositoryMatch'
     }
 
-    # Registrar cada pipeline coincidente para facilitar la auditoría.
     foreach ($match in $keyMatches) {
-        $notes = if ($repositoryGroups.Count -eq 1) {
-            'Candidato único; revisar la evidencia antes de aprobar.'
+        if ($repositoryGroups.Count -eq 1) {
+            $notes = 'Single repository candidate. Manual verification required.'
         }
         else {
-            'Existen varios repositorios candidatos. Revisión manual obligatoria.'
+            $notes = 'Multiple repositories match. Manual investigation required.'
         }
 
         $results.Add(
@@ -582,7 +630,7 @@ foreach ($sonarProject in $sonarRows) {
                 PipelineName     = $match.PipelineName
                 PipelineId       = $match.PipelineId
                 YamlPath         = $match.YamlPath
-                Evidence         = "Clave exacta encontrada en YAML. Estado de lectura: $($match.InventoryStatus)."
+                Evidence         = "Exact key found in YAML. Read status: $($match.InventoryStatus)"
                 Approved         = 'NO'
                 Notes            = $notes
             }
@@ -591,26 +639,28 @@ foreach ($sonarProject in $sonarRows) {
 }
 
 # ============================================================
-# 8. EXPORTAR RESULTADOS
+# 9. EXPORT AUDIT REPORT
 # ============================================================
 
-$results | Export-Csv `
-    -LiteralPath $OutputCsv `
-    -NoTypeInformation `
-    -Encoding UTF8
+$results |
+    Export-Csv `
+        -LiteralPath $OutputCsv `
+        -NoTypeInformation `
+        -Encoding UTF8
 
-$outputResolved = (Resolve-Path -LiteralPath $OutputCsv).Path
+$outputFullPath = [System.IO.Path]::GetFullPath($OutputCsv)
 
-Write-Host ''
-Write-Host '============================================'
-Write-Host 'DESCUBRIMIENTO COMPLETADO'
-Write-Host '============================================'
-Write-Host "Proyectos procesados: $($sonarRows.Count)"
-Write-Host "Pipelines YAML inventariadas: $($pipelineInventory.Count)"
-Write-Host "Filas de auditoría: $($results.Count)"
-Write-Host "CSV generado: $outputResolved"
-Write-Host ''
-Write-Host 'Resumen por estado:'
+Write-Host ""
+Write-Host "=============================================="
+Write-Host "DISCOVERY COMPLETED"
+Write-Host "=============================================="
+Write-Host "Input SonarQube projects: $($sonarRows.Count)"
+Write-Host "Azure DevOps projects: $($azProjects.Count)"
+Write-Host "YAML pipelines inventoried: $($pipelineInventory.Count)"
+Write-Host "Audit report rows: $($results.Count)"
+Write-Host "Output CSV: $outputFullPath"
+Write-Host ""
+Write-Host "Results by status:"
 
 $results |
     Group-Object -Property MatchStatus |
@@ -619,6 +669,6 @@ $results |
         Write-Host ("  {0}: {1}" -f $_.Name, $_.Count)
     }
 
-Write-Host ''
-Write-Host 'Este script no crea ni modifica bindings.'
-Write-Host 'Todos los candidatos quedan Approved=NO por defecto.'
+Write-Host ""
+Write-Host "This script is read-only. No bindings were created or modified."
+Write-Host "All candidate rows default to Approved=NO."
