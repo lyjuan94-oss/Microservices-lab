@@ -2,30 +2,20 @@
 # ============================================================
 # SonarQube Project Key Search in Azure DevOps YAML Files
 #
-# Scope:
-#   All projects and Git repositories in the AASolutions
-#   organization.
-#
-# Search method:
-#   1. Load SonarQube project keys from the input CSV.
-#   2. Enumerate Azure DevOps projects and Git repositories.
-#   3. List repository files recursively.
-#   4. Download only .yml and .yaml files.
-#   5. Search YAML content for SonarQube project keys.
-#
-# READ-ONLY:
-#   No pipelines are executed.
-#   No SonarQube bindings are created or modified.
-#
-# Required environment variables:
-#   AZDO_PAT or SYSTEM_ACCESSTOKEN
-#
 # Input:
 #   Sonar_Projects_Without_Binding.csv
 #
 # Output:
 #   Sonar_AzDO_File_Search_Results.csv
 #   Sonar_AzDO_File_Search_Errors.csv
+#
+# Search scope:
+#   All Azure DevOps projects and Git repositories.
+#   Only .yml and .yaml files are searched.
+#
+# READ-ONLY:
+#   No pipelines are executed.
+#   No SonarQube bindings are created or modified.
 # ============================================================
 
 [CmdletBinding()]
@@ -68,11 +58,130 @@ $AzureHeaders = @{
     Accept        = "application/json"
 }
 
-# Only these extensions will be downloaded and searched.
+# Only YAML files are searched.
 $SearchExtensions = @(".yml", ".yaml")
 
 # ------------------------------------------------------------
-# Helper functions
+# CSV IMPORT
+# Preserves the previously corrected CSV-reading behavior:
+# - Detect comma, semicolon, or tab delimiters.
+# - Handle UTF-8 BOM.
+# - Trim whitespace and BOM characters from headers.
+# - Normalize ProjectName and ProjectKey.
+# - Fall back to the first two columns if necessary.
+# ------------------------------------------------------------
+
+function Import-ProjectsCsv {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $FirstLine = Get-Content -LiteralPath $Path -TotalCount 1 -Encoding UTF8
+
+    if ([string]::IsNullOrWhiteSpace($FirstLine)) {
+        throw "The input CSV is empty or has no header row: $Path"
+    }
+
+    # Detect the delimiter used by the CSV header.
+    $DelimiterCandidates = @(
+        [PSCustomObject]@{
+            Character = ','
+            Count = ([regex]::Matches($FirstLine, ',')).Count
+        },
+        [PSCustomObject]@{
+            Character = ';'
+            Count = ([regex]::Matches($FirstLine, ';')).Count
+        },
+        [PSCustomObject]@{
+            Character = "`t"
+            Count = ([regex]::Matches($FirstLine, "`t")).Count
+        }
+    )
+
+    $Delimiter = (
+        $DelimiterCandidates |
+        Sort-Object Count -Descending |
+        Select-Object -First 1
+    ).Character
+
+    if (
+        ($DelimiterCandidates | Measure-Object -Property Count -Sum).Sum -eq 0
+    ) {
+        throw "Could not detect the CSV delimiter. Expected comma, semicolon, or tab."
+    }
+
+    Write-Host "CSV delimiter detected: $(
+        if ($Delimiter -eq "`t") { 'TAB' } else { $Delimiter }
+    )"
+
+    # Import the CSV using the detected delimiter.
+    $ImportedRows = @(
+        Import-Csv -LiteralPath $Path -Delimiter $Delimiter -Encoding UTF8
+    )
+
+    if ($ImportedRows.Count -eq 0) {
+        throw "The input CSV contains no data rows."
+    }
+
+    # Normalize headers to remove BOM and surrounding whitespace.
+    $HeaderMap = @{}
+
+    foreach ($Property in $ImportedRows[0].PSObject.Properties) {
+        $NormalizedHeader = ([string]$Property.Name).Trim()
+        $NormalizedHeader = $NormalizedHeader.Trim([char]0xFEFF)
+        $NormalizedHeader = $NormalizedHeader.Trim()
+
+        $HeaderMap[$NormalizedHeader.ToLowerInvariant()] = $Property.Name
+    }
+
+    $NameHeader = $HeaderMap["projectname"]
+    $KeyHeader = $HeaderMap["projectkey"]
+
+    # The known input format has ProjectName first and ProjectKey second.
+    # Use positional fallback if the header names are not recognized.
+    if (
+        [string]::IsNullOrWhiteSpace($NameHeader) -or
+        [string]::IsNullOrWhiteSpace($KeyHeader)
+    ) {
+        $FirstProperty = $ImportedRows[0].PSObject.Properties[0]
+        $SecondProperty = $ImportedRows[0].PSObject.Properties[1]
+
+        if ($null -eq $FirstProperty -or $null -eq $SecondProperty) {
+            throw "The input CSV must contain at least two columns."
+        }
+
+        Write-Warning "CSV headers were not recognized by name. Using the first column as ProjectName and the second as ProjectKey."
+
+        $NameHeader = $FirstProperty.Name
+        $KeyHeader = $SecondProperty.Name
+    }
+
+    $NormalizedRows = @(
+        foreach ($Row in $ImportedRows) {
+            $ProjectName = ([string]$Row.PSObject.Properties[$NameHeader].Value).Trim()
+            $ProjectKey = ([string]$Row.PSObject.Properties[$KeyHeader].Value).Trim()
+
+            if (
+                -not [string]::IsNullOrWhiteSpace($ProjectKey)
+            ) {
+                [PSCustomObject]@{
+                    ProjectName = $ProjectName
+                    ProjectKey  = $ProjectKey
+                }
+            }
+        }
+    )
+
+    if ($NormalizedRows.Count -eq 0) {
+        throw "No valid ProjectKey values were found in the input CSV."
+    }
+
+    return $NormalizedRows
+}
+
+# ------------------------------------------------------------
+# Azure DevOps API helpers
 # ------------------------------------------------------------
 
 function ConvertTo-EncodedSegment {
@@ -84,38 +193,10 @@ function ConvertTo-EncodedSegment {
     return [Uri]::EscapeDataString($Value)
 }
 
-function Get-ObjectProperty {
-    param(
-        [Parameter(Mandatory = $true)]
-        [object]$Object,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
-    )
-
-    if ($null -eq $Object) {
-        return $null
-    }
-
-    if ($Object -is [System.Collections.IDictionary]) {
-        return $Object[$Name]
-    }
-
-    $Property = $Object.PSObject.Properties[$Name]
-
-    if ($null -ne $Property) {
-        return $Property.Value
-    }
-
-    return $null
-}
-
 function Invoke-AzureGet {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Url,
-
-        [switch]$RawResponse
+        [string]$Url
     )
 
     if ($RequestDelayMilliseconds -gt 0) {
@@ -123,14 +204,6 @@ function Invoke-AzureGet {
     }
 
     try {
-        if ($RawResponse) {
-            return Invoke-WebRequest `
-                -Uri $Url `
-                -Headers $AzureHeaders `
-                -Method Get `
-                -UseBasicParsing
-        }
-
         return Invoke-RestMethod `
             -Uri $Url `
             -Headers $AzureHeaders `
@@ -139,47 +212,6 @@ function Invoke-AzureGet {
     catch {
         throw "Azure DevOps request failed. URL: $Url. Error: $($_.Exception.Message)"
     }
-}
-
-function Import-ProjectsCsv {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    $Rows = @(Import-Csv -LiteralPath $Path)
-
-    if ($Rows.Count -eq 0) {
-        throw "The input CSV contains no project keys."
-    }
-
-    $FirstRow = $Rows[0]
-
-    if (
-        $null -eq $FirstRow.PSObject.Properties["ProjectKey"] -or
-        $null -eq $FirstRow.PSObject.Properties["ProjectName"]
-    ) {
-        throw "The input CSV must contain ProjectKey and ProjectName columns."
-    }
-
-    $Projects = @(
-        foreach ($Row in $Rows) {
-            $Key = ([string]$Row.ProjectKey).Trim()
-
-            if (-not [string]::IsNullOrWhiteSpace($Key)) {
-                [PSCustomObject]@{
-                    ProjectKey  = $Key
-                    ProjectName = ([string]$Row.ProjectName).Trim()
-                }
-            }
-        }
-    )
-
-    if ($Projects.Count -eq 0) {
-        throw "No valid ProjectKey values were found in the input CSV."
-    }
-
-    return $Projects
 }
 
 function Get-AzureProjects {
@@ -246,17 +278,15 @@ function Get-RepositoryFileContent {
         return $Response
     }
 
-    $Content = Get-ObjectProperty -Object $Response -Name "content"
-
-    if ($null -ne $Content) {
-        return [string]$Content
+    if ($null -ne $Response.content) {
+        return [string]$Response.content
     }
 
     throw "The Azure DevOps response did not contain file content."
 }
 
 # ------------------------------------------------------------
-# Load SonarQube project keys
+# Load input keys
 # ------------------------------------------------------------
 
 Write-Host ""
@@ -264,7 +294,7 @@ Write-Host "Loading SonarQube project keys..." -ForegroundColor Cyan
 
 $SonarProjects = @(Import-ProjectsCsv -Path $InputCsv)
 
-Write-Host "SonarQube projects to search: $($SonarProjects.Count)"
+Write-Host "SonarQube project keys loaded: $($SonarProjects.Count)" -ForegroundColor Green
 
 # ------------------------------------------------------------
 # Search Azure DevOps YAML files
@@ -332,11 +362,11 @@ foreach ($AzureProject in $Projects) {
             continue
         }
 
-        # Keep only YAML files; ignore folders and other file types.
+        # Filter to YAML files only.
         $YamlFiles = @(
             foreach ($File in $Files) {
                 $FilePath = [string]$File.path
-                $IsFolder = [bool](Get-ObjectProperty -Object $File -Name "isFolder")
+                $IsFolder = [bool]$File.isFolder
 
                 if ($IsFolder -or [string]::IsNullOrWhiteSpace($FilePath)) {
                     continue
@@ -371,14 +401,15 @@ foreach ($AzureProject in $Projects) {
                 continue
             }
 
-            # Search every SonarQube key in this YAML file.
             foreach ($SonarProject in $SonarProjects) {
                 $Key = [string]$SonarProject.ProjectKey
 
-                if ($Content.IndexOf(
-                    $Key,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                ) -ge 0) {
+                if (
+                    $Content.IndexOf(
+                        $Key,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    ) -ge 0
+                ) {
                     $TotalMatches++
 
                     $Results.Add([PSCustomObject]@{
@@ -402,7 +433,7 @@ foreach ($AzureProject in $Projects) {
 }
 
 # ------------------------------------------------------------
-# Add explicit NoMatch rows for keys not found
+# Add NoMatch rows for keys not found
 # ------------------------------------------------------------
 
 $MatchedKeys = @{}
@@ -425,13 +456,13 @@ foreach ($SonarProject in $SonarProjects) {
             FilePath         = ""
             MatchStatus      = "NoMatch"
             Approved         = ""
-            Notes            = "Key was not found in the YAML files that were successfully scanned. Check the error CSV before concluding that no match exists."
+            Notes            = "Key was not found in successfully scanned YAML files. Check the error CSV before concluding that no match exists."
         })
     }
 }
 
 # ------------------------------------------------------------
-# Export results
+# Export CSV files
 # ------------------------------------------------------------
 
 $Results |
@@ -484,4 +515,4 @@ Write-Host ""
 Write-Host "Results CSV: $OutputCsv" -ForegroundColor Green
 Write-Host "Errors CSV:  $ErrorsCsv" -ForegroundColor Green
 Write-Host ""
-Write-Host "This script did not create or modify any SonarQube bindings."
+Write-Host "No SonarQube bindings were created or modified."
