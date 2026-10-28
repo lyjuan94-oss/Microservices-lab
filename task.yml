@@ -1,0 +1,12 @@
+
+- task: SonarQubePrepare@7
+  displayName: 'Prepare SonarQube'
+  inputs:
+    SonarQube: 'AAS-Sonar-AzurePaas-V2'
+    scannerMode: 'dotnet'
+    configMode: 'manual'
+    projectKey: 'SIAX-SIAX'
+    projectName: 'SIAX-SIAX'
+    extraProperties: |
+      sonar.exclusions=**/bin/**,**/obj/**,**/TestResults/**,**/coverage/**,**/node_modules/**,**/vendor/**,**/dist/**,**/build/**,**/out/**,**/target/**,**/.next/**,**/*.min.js,**/*.min.css,**/*.g.cs,**/*.generated.cs,**/*.designer.cs,**/*.g.vb,**/*.generated.vb,**/*.designer.vb
+      sonar.sourceEncoding=UTF-8
