@@ -8,5 +8,5 @@
     projectKey: 'SIAX-SIAX'
     projectName: 'SIAX-SIAX'
     extraProperties: |
-      sonar.exclusions=**/bin/**,**/obj/**,**/TestResults/**,**/coverage/**,**/node_modules/**,**/vendor/**,**/dist/**,**/build/**,**/out/**,**/target/**,**/.next/**,**/*.min.js,**/*.min.css,**/*.g.cs,**/*.generated.cs,**/*.designer.cs,**/*.g.vb,**/*.generated.vb,**/*.designer.vb
+      sonar.exclusions=**/*.sql,**/bin/**,**/obj/**,**/TestResults/**,**/coverage/**,**/node_modules/**,**/vendor/**,**/dist/**,**/build/**,**/out/**,**/target/**,**/.next/**,**/*.min.js,**/*.min.css,**/*.g.cs,**/*.generated.cs,**/*.designer.cs,**/*.g.vb,**/*.generated.vb,**/*.designer.vb
       sonar.sourceEncoding=UTF-8
