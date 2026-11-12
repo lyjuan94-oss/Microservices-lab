@@ -1,0 +1,3 @@
+$url = "https://higherlogicdownload.s3.amazonaws.com/IMWUC/98831a56-8916-4057-b7d4-0192e836b17c_file.pdf"
+
+Invoke-WebRequest -Uri $url -Method Head
