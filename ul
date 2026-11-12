@@ -1,3 +1,33 @@
 $url = "https://higherlogicdownload.s3.amazonaws.com/IMWUC/98831a56-8916-4057-b7d4-0192e836b17c_file.pdf"
 
 Invoke-WebRequest -Uri $url -Method Head
+
+.....
+
+
+$query = '"Multi Cloud Strategy at AXA Switzerland"'
+
+Start-Process "https://www.google.com/search?q=$([uri]::EscapeDataString($query))"
+
+....
+
+$url = Read-Host "Introduce la URL completa"
+
+Invoke-WebRequest `
+    -Uri $url `
+    -OutFile "$env:USERPROFILE\Downloads\axa-document.pdf"
+.....
+
+
+$url = "https://higherlogicdownload.s3.amazonaws.com/IMWUC/98831a56-8916-4057-b7d4-0192e836b17c_file.pdf"
+
+$response = Invoke-WebRequest `
+    -Uri $url `
+    -Method Head `
+    -SkipHttpErrorCheck
+
+[PSCustomObject]@{
+    StatusCode = $response.StatusCode
+    ContentType = $response.Headers["Content-Type"]
+    Server = $response.Headers["Server"]
+}
